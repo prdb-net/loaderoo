@@ -129,21 +129,24 @@ struct CatalogGallery: View {
 
 struct CatalogCast: View {
     let members: [CastMember]
+    let openProfile: (CatalogSubject) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             Text("Cast").font(.headline)
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), alignment: .leading)], alignment: .leading, spacing: 6) {
                 ForEach(members) { member in
-                    HStack(spacing: 6) {
-                        AsyncImage(url: member.portrait) { phase in
-                            if let image = phase.image { image.resizable().scaledToFill() }
-                            else { Image(systemName: "person.fill").foregroundStyle(.secondary) }
+                    Button { openProfile(CatalogSubject(actor: member)) } label: {
+                        HStack(spacing: 6) {
+                            AsyncImage(url: member.portrait) { phase in
+                                if let image = phase.image { image.resizable().scaledToFill() }
+                                else { Image(systemName: "person.fill").foregroundStyle(.secondary) }
+                            }
+                            .frame(width: 26, height: 26).background(.quaternary).clipShape(Circle())
+                            .accessibilityHidden(true)
+                            Text(member.name).font(.callout)
                         }
-                        .frame(width: 26, height: 26).background(.quaternary).clipShape(Circle())
-                        .accessibilityHidden(true)
-                        Text(member.name).font(.callout).textSelection(.enabled)
-                    }
+                    }.buttonStyle(.link)
                 }
             }
         }

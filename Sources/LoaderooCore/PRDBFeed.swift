@@ -43,6 +43,9 @@ struct FeedMetadata: Codable {
     let id: UUID
     let title: String
     let studio: String?
+    let studioID: UUID?
+    let studioContext: String?
+    let releaseDate: Date?
     let image: URL?
     let siteImages: [URL]?
     let cast: [CastMember]?
@@ -138,11 +141,18 @@ struct PRDBFeed {
     }
 
     func video(_ id: UUID, key: String) async throws -> FeedMetadata {
-        struct Site: Decodable { let title: String }
+        struct Network: Decodable { let title: String }
+        struct Site: Decodable {
+            let id: UUID?
+            let title: String
+            let platformTitle: String?
+            let network: Network?
+        }
         struct Actor: Decodable { let id: UUID; let name: String; let images: [Artwork]? }
         struct Detail: Decodable {
             let id: UUID
             let title: String
+            let releaseDate: String?
             let site: Site?
             let images: [Artwork]?
             let actors: [Actor]?
@@ -153,6 +163,8 @@ struct PRDBFeed {
         let cast = detail.actors?.map { CastMember(id: $0.id, name: $0.name, portrait: $0.images?.lazy.compactMap(\.usableURL).first) } ?? []
         let previews = images.isEmpty ? try await userPreviews(id, key: key) : nil
         return FeedMetadata(id: id, title: detail.title, studio: detail.site?.title,
+                            studioID: detail.site?.id, studioContext: detail.site?.network?.title ?? detail.site?.platformTitle,
+                            releaseDate: detail.releaseDate.flatMap { try? Date($0, strategy: .iso8601.year().month().day().dateSeparator(.dash)) },
                             image: images.first ?? previews?.stills.first, siteImages: images, cast: cast, userPreviews: previews)
     }
 }

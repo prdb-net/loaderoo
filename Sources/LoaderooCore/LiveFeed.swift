@@ -12,6 +12,9 @@ public struct FeedOffer: Identifiable, Sendable {
 public struct FeedTitle: Identifiable, Sendable {
     public let id: UUID
     public let title: String
+    public let studioID: UUID?
+    public let studioContext: String?
+    public let releaseDate: Date?
     public let studio: String?
     public let preview: URL?
     public let siteImages: [URL]
@@ -113,6 +116,10 @@ public actor LiveFeed {
             if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade WHERE version=2)") == false {
                 try db.execute(sql: "UPDATE metadata SET fetched=0 WHERE json_extract(CAST(payload AS TEXT),'$.siteImages') IS NULL")
                 try db.execute(sql: "INSERT INTO previewUpgrade VALUES(2)")
+            }
+            if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade WHERE version=3)") == false {
+                try db.execute(sql: "UPDATE metadata SET fetched=0")
+                try db.execute(sql: "INSERT INTO previewUpgrade VALUES(3)")
             }
         }
     }
@@ -391,7 +398,9 @@ public actor LiveFeed {
             }
             page.titles = groups.values.map { group in
                 let detail = group.metadata
-                return FeedTitle(id: detail.id, title: detail.title, studio: detail.studio, preview: detail.image,
+                return FeedTitle(id: detail.id, title: detail.title, studioID: detail.studioID,
+                                 studioContext: detail.studioContext, releaseDate: detail.releaseDate,
+                                 studio: detail.studio, preview: detail.image,
                                  siteImages: detail.siteImages ?? detail.image.map { [$0] } ?? [],
                                  cast: detail.cast ?? [], userPreviews: detail.userPreviews,
                                  posted: group.posted, sources: group.sources.sorted(), qualities: group.qualities.sorted(),

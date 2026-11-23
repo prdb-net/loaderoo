@@ -50,6 +50,8 @@ private actor Services {
                                     "contentKind": "single", "recheckAfterUtc": "2026-11-23T08:02:00.1234567Z"])
                 }
                 data = try JSONSerialization.data(withJSONObject: ["results": Array(results.reversed())])
+            } else if url.path.hasPrefix("/actors/") {
+                data = Data(#"{"name":"Sam","nationalityLabel":"Canada","careerStart":2012,"aliases":[{"name":"River"}]}"#.utf8)
             } else if url.lastPathComponent == "user-images" {
                 previewRequests += 1
                 data = userImages
@@ -58,7 +60,8 @@ private actor Services {
                 data = try JSONSerialization.data(withJSONObject: [
                     "id": id.uuidString, "title": id == Self.first ? "Harbor Lights" : "Late Arrival",
                     "actors": [["id": Self.second.uuidString, "name": "Sam", "images": [["url":"https://art.example.invalid/portrait.jpg"]]]],
-                    "site": ["title": "Test Studio"], "images": hasImages ? [["url": "https://art.example.invalid/still.jpg"]] : []])
+                    "releaseDate": "2026-11-20",
+                    "site": ["title": "Test Studio", "id": Self.first.uuidString, "network": ["title": "Studio Group"]], "images": hasImages ? [["url": "https://art.example.invalid/still.jpg"]] : []])
             }
         } else {
             searches.append(host)
@@ -208,7 +211,13 @@ struct LiveFeedTests {
         try await feed.configure(connections())
         let title = try #require(try await feed.refresh().titles.first)
         #expect(title.siteImages == [title.preview].compactMap { $0 })
+        #expect(title.releaseDate == feedDate("2026-11-20T00:00:00Z"))
+        #expect(title.studioID == Services.first)
+        #expect(title.studioContext == "Studio Group")
         #expect(title.cast.first?.name == "Sam")
+        let actor = try await feed.actorProfile(Services.second)
+        #expect(actor.aliases?.first?.name == "River")
+        #expect(actor.careerStart == 2012)
         #expect(title.cast.first?.portrait?.lastPathComponent == "portrait.jpg")
         #expect(await service.previewRequests == 0)
         async let hover = feed.catalogPreviews(for: title.id)

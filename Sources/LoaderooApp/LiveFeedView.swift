@@ -2,10 +2,25 @@ import AVFoundation
 import SwiftUI
 import LoaderooCore
 
+private enum LiveSection: String, CaseIterable, Identifiable {
+    case releases = "Catalog", studios = "Studios", actors = "Actors", downloads = "Downloads", library = "Library"
+    var id: Self { self }
+    var symbol: String {
+        switch self {
+        case .studios: DirectoryKind.studios.symbol
+        case .actors: DirectoryKind.actors.symbol
+        case .downloads: SectionName.downloads.symbol
+        case .library: SectionName.library.symbol
+        case .releases: SectionName.releases.symbol
+        }
+    }
+}
+
 struct LiveFeedView: View {
     let openDemo: () -> Void
     @State private var model = FeedWorkspace()
-    @State private var selection: SectionName = .releases
+    @State private var selection: LiveSection = .releases
+    @State private var subject: CatalogSubject?
     @State private var editing = false
     @State private var sabTab = false
     @State private var downloadSelection: String?
@@ -16,8 +31,11 @@ struct LiveFeedView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(SectionName.allCases, selection: $selection) { section in
-                Label(section == .releases ? "Catalog" : section.rawValue, systemImage: section.symbol)
+            List(LiveSection.allCases, selection: Binding(get: { selection }, set: {
+                subject = nil
+                selection = $0
+            })) { section in
+                Label(section.rawValue, systemImage: section.symbol)
                     .badge(count(section)).tag(section)
             }
             .listStyle(.sidebar)
@@ -78,7 +96,10 @@ struct LiveFeedView: View {
             } else {
                 switch selection {
                 case .releases:
-                    CatalogView(model: model, controls: { searchControls }, download: downloadButton)
+                    CatalogView(model: model, openProfile: openProfile, controls: { searchControls }, download: downloadButton)
+                case .actors, .studios:
+                    CatalogDirectoryView(model: model, kind: selection == .actors ? .actors : .studios, subject: $subject,
+                                         openProfile: openProfile, download: downloadButton).id(selection)
                 case .library:
                     HStack {
                         Button("Manage Folders", systemImage: "folder.badge.gearshape") { manageFolders = true }
@@ -110,7 +131,7 @@ struct LiveFeedView: View {
                     switch selection {
                     case .downloads: await model.follow()
                     case .library: await model.scan()
-                    case .releases: await model.refresh(manual: true)
+                    case .releases, .actors, .studios: await model.refresh(manual: true)
                     }
                 }
             } label: {
@@ -126,15 +147,22 @@ struct LiveFeedView: View {
 
     private var refreshing: Bool {
         switch selection {
-        case .releases: model.loading
+        case .releases, .actors, .studios: model.loading
         case .downloads: model.following
         case .library: model.scanning
         }
     }
 
     private func settings(sab: Bool = false) { sabTab = sab; editing = true }
-    private func count(_ section: SectionName) -> Int {
+    private func openProfile(_ target: CatalogSubject) {
+        selection = target.kind == .actors ? .actors : .studios
+        subject = target
+    }
+
+    private func count(_ section: LiveSection) -> Int {
         switch section {
+        case .actors: model.actors.count
+        case .studios: model.studios.count
         case .releases: model.page.titles.count
         case .library: model.files.count + filed.count
         case .downloads: model.jobs.count

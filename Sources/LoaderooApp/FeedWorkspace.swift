@@ -5,7 +5,16 @@ import LoaderooCore
 final class FeedWorkspace {
     var engine: LiveFeed?
     var config: FeedConnections?
-    var page = FeedPage()
+    var page = FeedPage() {
+        didSet {
+            studios = DirectoryEntry.entries(in: page, kind: .studios)
+            actors = DirectoryEntry.entries(in: page, kind: .actors)
+        }
+    }
+    private(set) var studios: [DirectoryEntry] = []
+    private(set) var actors: [DirectoryEntry] = []
+    var catalogFilter = CatalogFilter()
+    var selectedRelease: UUID?
     var catalogQuery = "" {
         didSet { if catalogQuery != oldValue { indexerSearch = nil } }
     }
@@ -82,19 +91,23 @@ final class FeedWorkspace {
         } catch { self.error = error.localizedDescription }
     }
 
-    func refresh(manual: Bool = false, earlier: Bool = false, search: IndexerSearch? = nil) async {
-        guard let engine, config != nil, !loading else { return }
+    @discardableResult
+    func refresh(manual: Bool = false, earlier: Bool = false, search: IndexerSearch? = nil,
+                 forCatalog: Bool = true) async -> IndexerSearch? {
+        guard let engine, config != nil, !loading else { return nil }
         loading = true
         defer { loading = false }
         do {
             let result = try await engine.refresh(manual: manual, earlier: earlier, search: search)
             page = result
-            if let search, catalogQuery.trimmingCharacters(in: .whitespacesAndNewlines) == search.term {
+            if forCatalog, let search, catalogQuery.trimmingCharacters(in: .whitespacesAndNewlines) == search.term {
                 indexerSearch = result.indexerSearch
             }
             error = nil
+            return result.indexerSearch
         } catch is CancellationError { }
         catch { self.error = error.localizedDescription }
+        return nil
     }
 
     func save(_ draft: FeedConnections, verifySAB: Bool) async throws {

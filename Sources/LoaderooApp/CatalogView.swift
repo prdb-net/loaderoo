@@ -3,12 +3,17 @@ import LoaderooCore
 
 struct CatalogView<Controls: View, Action: View>: View {
     let model: FeedWorkspace
+    let openProfile: (CatalogSubject) -> Void
     @ViewBuilder let controls: () -> Controls
     @ViewBuilder let download: (FeedTitle, FeedOffer?) -> Action
     @AppStorage("catalogListLayout") private var listLayout = false
     @AppStorage("catalogOnlyWithPreview") private var onlyWithPreview = true
-    @State private var filter = CatalogFilter()
-    @State private var selected: UUID?
+    @State private var filtering = false
+    private var filter: CatalogFilter { model.catalogFilter }
+    private var selected: UUID? {
+        get { model.selectedRelease }
+        nonmutating set { model.selectedRelease = newValue }
+    }
     @State private var scrollAnchor: UUID?
 
     private var query: String { model.catalogQuery.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -36,7 +41,7 @@ struct CatalogView<Controls: View, Action: View>: View {
                 .overlay(alignment: .trailing) {
                     if let detail {
                         DetailPanel(title: "Release details", close: { selected = nil }) {
-                            CatalogDetail(title: detail, engine: model.engine, hasDownload: model.activeJob(for: detail) != nil) { offer in
+                            CatalogDetail(title: detail, engine: model.engine, openProfile: openProfile, hasDownload: model.activeJob(for: detail) != nil) { offer in
                                 download(detail, offer)
                             }
                         }.id(detail.id)
@@ -49,6 +54,12 @@ struct CatalogView<Controls: View, Action: View>: View {
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 8)
         }
         .frame(minHeight: 0, maxHeight: .infinity)
+        .sheet(isPresented: $filtering) {
+            CatalogFilterDialog(model: model, draft: filter, onlyWithPreview: onlyWithPreview) { draft, previews in
+                model.catalogFilter = draft
+                onlyWithPreview = previews
+            }
+        }
     }
 
     @ViewBuilder private func results(_ titles: [FeedTitle]) -> some View {
@@ -87,7 +98,11 @@ struct CatalogView<Controls: View, Action: View>: View {
 
     private func toolbar(compact: Bool) -> some View {
         HStack(spacing: 10) {
-            filterMenu
+            let count = [onlyWithPreview, !filter.studioIDs.isEmpty, !filter.actorIDs.isEmpty,
+                         filter.quality != nil, filter.indexer != nil, filter.days != nil].filter { $0 }.count
+            Button(count == 0 ? "Filters" : "Filters (\(count))", systemImage: "line.3.horizontal.decrease.circle") {
+                filtering = true
+            }.fixedSize()
             if !compact && filter != CatalogFilter() {
                 Button("Clear filters", action: clearFilters).buttonStyle(.link).fixedSize()
             }
@@ -107,39 +122,9 @@ struct CatalogView<Controls: View, Action: View>: View {
         }
     }
 
-    private var filterMenu: some View {
-        Menu {
-            Toggle("Only titles with previews", isOn: $onlyWithPreview)
-            Divider()
-            options("Studio", values: model.page.titles.compactMap(\.studio), selection: $filter.studio)
-            options("Quality", values: model.page.titles.flatMap(\.qualities), selection: $filter.quality)
-            options("Indexer", values: model.config?.indexers.map(\.name) ?? [], selection: $filter.indexer)
-            Picker("Posting date", selection: $filter.days) {
-                Text("Any time").tag(nil as Int?)
-                ForEach([7, 30, 90, 365], id: \.self) { days in
-                    Text("Last \(days) days").tag(Optional(days))
-                }
-            }
-            if onlyWithPreview || filter != CatalogFilter() {
-                Divider()
-                Button("Clear filters", action: clearFilters)
-            }
-        } label: {
-            let count = [onlyWithPreview, filter.studio != nil, filter.quality != nil, filter.indexer != nil, filter.days != nil].filter { $0 }.count
-            Label(count == 0 ? "Filters" : "Filters (\(count))", systemImage: "line.3.horizontal.decrease.circle")
-        }.fixedSize()
-    }
-
     private func clearFilters() {
-        filter = CatalogFilter()
+        model.catalogFilter = CatalogFilter()
         onlyWithPreview = false
-    }
-
-    private func options(_ label: String, values: [String], selection: Binding<String?>) -> some View {
-        Picker(label, selection: selection) {
-            Text("All").tag(nil as String?)
-            ForEach(Set(values).sorted(), id: \.self) { value in Text(value).tag(Optional(value)) }
-        }
     }
 
     private func status(_ count: Int) -> some View {
@@ -221,9 +206,10 @@ struct CatalogView<Controls: View, Action: View>: View {
     }
 }
 
-private struct CatalogDetail<Action: View>: View {
+struct CatalogDetail<Action: View>: View {
     let title: FeedTitle
     let engine: LiveFeed?
+    let openProfile: (CatalogSubject) -> Void
     let hasDownload: Bool
     @ViewBuilder let action: (FeedOffer?) -> Action
 
@@ -231,8 +217,10 @@ private struct CatalogDetail<Action: View>: View {
         VStack(alignment: .leading, spacing: 14) {
             CatalogGallery(title: title, engine: engine)
             Text(title.title).font(.title2.bold()).textSelection(.enabled)
-            if let studio = title.studio { Text(studio).foregroundStyle(.secondary) }
-            if !title.cast.isEmpty { CatalogCast(members: title.cast) }
+            if let studio = CatalogSubject(studioOf: title) {
+                Button(studio.name) { openProfile(studio) }.buttonStyle(.link)
+            }
+            if !title.cast.isEmpty { CatalogCast(members: title.cast, openProfile: openProfile) }
             if hasDownload { action(nil) }
             Divider()
             Text("Usenet releases (\(title.offers.count))").font(.headline)
