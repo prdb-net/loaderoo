@@ -6,11 +6,16 @@ final class FeedWorkspace {
     var engine: LiveFeed?
     var config: FeedConnections?
     var page = FeedPage()
+    var catalogQuery = "" {
+        didSet { if catalogQuery != oldValue { indexerSearch = nil } }
+    }
+    var indexerSearch: IndexerSearch?
     var loading = false
     var ready = false
     var folders: [LibraryFolder] = []
     var files: [LibraryFile] = []
     var jobs: [Transfer] = []
+    var following = false
     var scanning = false
     var sending = Set<UUID>()
     var downloadIssue: String?
@@ -26,7 +31,9 @@ final class FeedWorkspace {
     }
 
     func follow() async {
-        guard let engine else { return }
+        guard let engine, !following else { return }
+        following = true
+        defer { following = false }
         do {
             try await engine.followDownloads()
             downloadIssue = nil
@@ -47,11 +54,15 @@ final class FeedWorkspace {
         do { try await reload() } catch { self.error = error.localizedDescription }
     }
 
-    func download(_ item: FeedTitle) async {
+    func activeJob(for title: FeedTitle) -> Transfer? {
+        jobs.first { $0.video == title.id.uuidString && !$0.retryable }
+    }
+
+    func download(_ item: FeedTitle, offerID: String?) async {
         guard let engine, sending.insert(item.id).inserted else { return }
         defer { sending.remove(item.id) }
         do {
-            try await engine.startDownload(item.id)
+            try await engine.startDownload(item.id, offerID: offerID)
             try await reload()
             error = nil
         } catch { self.error = error.localizedDescription }
@@ -71,12 +82,16 @@ final class FeedWorkspace {
         } catch { self.error = error.localizedDescription }
     }
 
-    func refresh(manual: Bool = false, earlier: Bool = false) async {
+    func refresh(manual: Bool = false, earlier: Bool = false, search: IndexerSearch? = nil) async {
         guard let engine, config != nil, !loading else { return }
         loading = true
         defer { loading = false }
         do {
-            page = try await engine.refresh(manual: manual, earlier: earlier)
+            let result = try await engine.refresh(manual: manual, earlier: earlier, search: search)
+            page = result
+            if let search, catalogQuery.trimmingCharacters(in: .whitespacesAndNewlines) == search.term {
+                indexerSearch = result.indexerSearch
+            }
             error = nil
         } catch is CancellationError { }
         catch { self.error = error.localizedDescription }
@@ -86,6 +101,7 @@ final class FeedWorkspace {
         guard let engine else { throw CocoaError(.fileReadUnknown) }
         try await engine.configure(draft, verifySAB: verifySAB)
         config = try await engine.connections()
+        indexerSearch = nil
         page = try await engine.cached()
     }
 }

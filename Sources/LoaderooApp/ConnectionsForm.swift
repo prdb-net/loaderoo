@@ -114,6 +114,16 @@ private struct SABForm: View {
             }
         }
         Section {
+            Picker("Preferred quality", selection: $connection.preferredQuality) {
+                Text("No preference").tag(nil as ReleaseQuality?)
+                ForEach(ReleaseQuality.allCases, id: \.self) { quality in
+                    Text(quality.label).tag(Optional(quality))
+                }
+            }
+        } header: { Text("Automatic NZB selection") } footer: {
+            Text("The catalog tries your preferred quality first, then other releases. Within each group, it tries the newest upload first.")
+        }
+        Section {
             TextField("Container folder", text: $connection.remoteRoot)
             directory("Mounted on Mac", path: $connection.mount)
             directory("Studio library", path: $connection.destination)

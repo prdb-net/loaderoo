@@ -20,11 +20,33 @@ struct Resolution: Decodable {
     }
 }
 
+public struct CastMember: Codable, Identifiable, Sendable {
+    public let id: UUID
+    public let name: String
+    public let portrait: URL?
+}
+
+public struct PreviewSheet: Codable, Equatable, Sendable {
+    public let url: URL
+    public let frames: Int
+    public let columns: Int
+    public let tileWidth: Int
+    public let tileHeight: Int
+}
+
+public struct UserPreviews: Codable, Sendable {
+    public let stills: [URL]
+    public let sheet: PreviewSheet?
+}
+
 struct FeedMetadata: Codable {
     let id: UUID
     let title: String
     let studio: String?
     let image: URL?
+    let siteImages: [URL]?
+    let cast: [CastMember]?
+    var userPreviews: UserPreviews?
 }
 
 struct PRDBFeed {
@@ -79,25 +101,58 @@ struct PRDBFeed {
         return answer.results
     }
 
+    private struct Artwork: Decodable {
+        let url: String?
+        var usableURL: URL? { PRDBFeed.imageURL(url) }
+    }
+
+    private static func imageURL(_ raw: String?) -> URL? {
+        guard let raw, let url = URL(string: raw), url.scheme?.lowercased() == "https",
+              url.host?.isEmpty == false, url.user == nil, url.password == nil else { return nil }
+        return url
+    }
+
+    func userPreviews(_ id: UUID, key: String) async throws -> UserPreviews {
+        struct Preview: Decodable {
+            let previewImageType: String
+            let url: String?
+            let spriteTileCount, spriteTileWidth, spriteTileHeight, spriteColumns, spriteRows: Int?
+
+            var sheet: PreviewSheet? {
+                guard previewImageType.lowercased() == "spritesheet", let url = PRDBFeed.imageURL(url),
+                      let count = spriteTileCount, count > 0,
+                      let width = spriteTileWidth, width > 0, let height = spriteTileHeight, height > 0,
+                      let columns = spriteColumns, columns > 0, let rows = spriteRows, rows > 0 else { return nil }
+                let capacity = columns.multipliedReportingOverflow(by: rows)
+                guard !capacity.overflow else { return nil }
+                return PreviewSheet(url: url, frames: min(count, capacity.partialValue), columns: columns,
+                                    tileWidth: width, tileHeight: height)
+            }
+        }
+        let previews: [Preview]
+        do { previews = try await fetch("videos/" + id.uuidString + "/user-images", key: key) }
+        catch let failure as HTTPFailure where failure.status == 404 { previews = [] }
+        let stills = previews.filter { $0.previewImageType.lowercased() == "single" }
+            .compactMap { Self.imageURL($0.url) }
+        return UserPreviews(stills: stills, sheet: previews.lazy.compactMap(\.sheet).first)
+    }
+
     func video(_ id: UUID, key: String) async throws -> FeedMetadata {
         struct Site: Decodable { let title: String }
-        struct Artwork: Decodable { let url: String? }
-        struct Detail: Decodable { let id: UUID; let title: String; let site: Site?; let images: [Artwork]? }
+        struct Actor: Decodable { let id: UUID; let name: String; let images: [Artwork]? }
+        struct Detail: Decodable {
+            let id: UUID
+            let title: String
+            let site: Site?
+            let images: [Artwork]?
+            let actors: [Actor]?
+        }
         let detail: Detail = try await fetch("videos/" + id.uuidString, key: key)
         guard detail.id == id else { throw FeedError("PRDB returned a different video ID.") }
-        var image = detail.images?.compactMap { $0.url.flatMap(URL.init(string:)) }.first {
-            $0.scheme?.lowercased() == "https" && $0.host != nil && $0.user == nil && $0.password == nil
-        }
-        if image == nil {
-            struct Still: Decodable { let previewImageType: String; let url: String? }
-            let alternatives: [Still]
-            do { alternatives = try await fetch("videos/" + id.uuidString + "/user-images", key: key) }
-            catch let failure as HTTPFailure where failure.status == 404 { alternatives = [] }
-            image = alternatives.lazy.filter { $0.previewImageType.lowercased() == "single" }
-                .compactMap { $0.url.flatMap(URL.init(string:)) }.first {
-                    $0.scheme == "https" && $0.host != nil && $0.user == nil && $0.password == nil
-                }
-        }
-        return FeedMetadata(id: id, title: detail.title, studio: detail.site?.title, image: image)
+        let images = detail.images?.compactMap(\.usableURL) ?? []
+        let cast = detail.actors?.map { CastMember(id: $0.id, name: $0.name, portrait: $0.images?.lazy.compactMap(\.usableURL).first) } ?? []
+        let previews = images.isEmpty ? try await userPreviews(id, key: key) : nil
+        return FeedMetadata(id: id, title: detail.title, studio: detail.site?.title,
+                            image: images.first ?? previews?.stills.first, siteImages: images, cast: cast, userPreviews: previews)
     }
 }

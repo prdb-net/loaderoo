@@ -8,7 +8,7 @@ Setup requires a valid personal PRDB API key. PRDB’s public API supplies title
 
 Loaderoo automatically matches indexer listings to PRDB videos. A video appears in the feed once at least one listing has a confirmed match and the video is missing from your library. Ambiguous listings stay out of the feed until PRDB can resolve them. Loaderoo rechecks them in the background as new information becomes available.
 
-The feed sorts by Usenet posting time, newest first. A video released last year and uploaded today can appear among today’s posts. Each entry shows the preview image when available, the title and studio, and the quality when known. When several indexers offer the same video, the entry has one **Download** action. Loaderoo chooses the source and NZB automatically.
+The feed sorts by Usenet posting time, newest first. A video released last year and uploaded today can appear among today’s posts. Each entry shows the preview image when available, the title and studio, and the quality when known. When several indexers offer the same video, the entry has one **Download** action. Loaderoo chooses the source and NZB automatically, trying the user’s preferred quality first when set. Opening the title shows the individual offers, each with a Download action for that exact NZB.
 
 Loaderoo checks ownership by PRDB video ID. Once a file on disk is linked to that ID, the feed hides every offer for the video, regardless of the quality of the file or the offer. For example, owning *Night Shift* in 1080p hides its 4K upload and any upload with unknown quality. A local copy of unknown quality counts just as well.
 

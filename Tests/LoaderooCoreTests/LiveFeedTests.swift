@@ -11,6 +11,11 @@ private actor Services {
     var batches = 0
     var origins: [String] = []
     var searches: [String] = []
+    var previewRequests = 0
+    var userImages = Data("[]".utf8)
+    func setUserImages(_ data: Data) { userImages = data }
+    var hasImages = true
+    func setImagesAvailable(_ available: Bool) { hasImages = available }
 
     func confirmPending() { rechecked = true }
     func fail(_ host: String) { failingHost = host }
@@ -45,11 +50,15 @@ private actor Services {
                                     "contentKind": "single", "recheckAfterUtc": "2026-11-23T08:02:00.1234567Z"])
                 }
                 data = try JSONSerialization.data(withJSONObject: ["results": Array(results.reversed())])
+            } else if url.lastPathComponent == "user-images" {
+                previewRequests += 1
+                data = userImages
             } else {
                 let id = try #require(UUID(uuidString: url.lastPathComponent))
                 data = try JSONSerialization.data(withJSONObject: [
                     "id": id.uuidString, "title": id == Self.first ? "Harbor Lights" : "Late Arrival",
-                    "site": ["title": "Test Studio"], "images": [["url": "https://art.example.invalid/still.jpg"]]])
+                    "actors": [["id": Self.second.uuidString, "name": "Sam", "images": [["url":"https://art.example.invalid/portrait.jpg"]]]],
+                    "site": ["title": "Test Studio"], "images": hasImages ? [["url": "https://art.example.invalid/still.jpg"]] : []])
             }
         } else {
             searches.append(host)
@@ -180,6 +189,75 @@ struct LiveFeedTests {
         changed.indexers.removeFirst()
         try await reopened.configure(changed)
         #expect(try await reopened.cached().titles.first?.sources == ["two"])
+    }
+
+    @Test func galleryFetchIsSharedAndSurvivesRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = Services()
+        let response = Data("""
+            [{"previewImageType":"Single","url":"https://art.example.invalid/frame.jpg"},
+             {"previewImageType":"Single","url":"file:///invalid.jpg"},
+             {"previewImageType":"SpriteSheet","url":"https://art.example.invalid/incomplete.jpg"},
+             {"previewImageType":"SpriteSheet","url":"https://art.example.invalid/tiles.jpg",
+              "spriteColumns":3,"spriteRows":2,"spriteTileCount":5,"spriteTileWidth":160,"spriteTileHeight":90}]
+            """.utf8)
+        await service.setUserImages(response)
+        let http = FeedHTTP { try await service.respond($0) }
+        let feed = try LiveFeed(root: root, http: http)
+        try await feed.configure(connections())
+        let title = try #require(try await feed.refresh().titles.first)
+        #expect(title.siteImages == [title.preview].compactMap { $0 })
+        #expect(title.cast.first?.name == "Sam")
+        #expect(title.cast.first?.portrait?.lastPathComponent == "portrait.jpg")
+        #expect(await service.previewRequests == 0)
+        async let hover = feed.catalogPreviews(for: title.id)
+        async let details = feed.catalogPreviews(for: title.id)
+        let (first, second) = try await (hover, details)
+        #expect(first.sheet?.frames == 5)
+        #expect(first.sheet?.columns == 3)
+        #expect(first.sheet?.url.lastPathComponent == "tiles.jpg")
+        #expect(second.stills.map(\.lastPathComponent) == ["frame.jpg"])
+        let reopened = try LiveFeed(root: root, http: http)
+        #expect(try await reopened.cached().titles.first?.userPreviews?.sheet == first.sheet)
+        _ = try await reopened.catalogPreviews(for: title.id)
+        #expect(await service.previewRequests == 1)
+    }
+
+    @Test func sheetWithoutAStillIsVisibleInThePreviewCatalog() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = Services()
+        await service.setImagesAvailable(false)
+        await service.setUserImages(Data("""
+            [{"previewImageType":"SpriteSheet","url":"https://art.example.invalid/tiles.jpg",
+              "spriteColumns":2,"spriteRows":1,"spriteTileCount":3,"spriteTileWidth":160,"spriteTileHeight":90}]
+            """.utf8))
+        let feed = try LiveFeed(root: root, http: FeedHTTP { try await service.respond($0) })
+        try await feed.configure(connections())
+        let page = try await feed.refresh()
+        let title = try #require(CatalogFilter().titles(in: page, matching: "", search: nil).first)
+        #expect(title.preview == nil)
+        #expect(title.userPreviews?.sheet?.frames == 2)
+    }
+
+    @Test func manualRefreshFindsNewPreviewsForFilteredTitles() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let service = Services()
+        await service.setImagesAvailable(false)
+        let feed = try LiveFeed(root: root, http: FeedHTTP { try await service.respond($0) })
+        try await feed.configure(connections())
+        let now = try #require(feedDate("2026-11-23T08:00:00Z"))
+        let first = try await feed.refresh(now: now)
+        let filter = CatalogFilter()
+        #expect(filter.titles(in: first, matching: "", search: nil).isEmpty)
+        #expect(filter.titles(in: first, matching: "Harbor", search: nil, onlyWithPreview: false).count == 1)
+        await service.setImagesAvailable(true)
+        let early = try await feed.refresh(manual: true, now: now.addingTimeInterval(30))
+        #expect(filter.titles(in: early, matching: "", search: nil).isEmpty)
+        let updated = try await feed.refresh(manual: true, now: now.addingTimeInterval(901))
+        #expect(filter.titles(in: updated, matching: "Harbor", search: nil).count == 1)
     }
 
     @Test func failedIndexerLeavesOtherSourcesAvailableAndHonorsCooldown() async throws {

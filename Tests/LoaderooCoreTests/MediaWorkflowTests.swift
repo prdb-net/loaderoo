@@ -4,13 +4,22 @@ import Testing
 
 private actor MediaAPI {
     let id = UUID()
+    let archiveID = UUID()
     let artwork = URL(string: "https://images.example.invalid/still.jpg")!
     var searches: [Int] = []
+    var terms: [String] = []
     var submissions = 0
+    var requestedNZBs: [String] = []
+    var invalidNZB: String?
+    func invalidateNZB(_ id: String) { invalidNZB = id }
     let disposition: String?
     var jobName: String?
     var uploadFilename: String?
-    init(disposition: String? = nil) { self.disposition = disposition }
+    let include4K: Bool
+    init(disposition: String? = nil, include4K: Bool = false) {
+        self.disposition = disposition
+        self.include4K = include4K
+    }
     var completed = false
     var loseReply = false
     func finish() { completed = true }
@@ -28,8 +37,11 @@ private actor MediaAPI {
             case "/user-identity": data = try json(["userHash":"test"])
             case "/releases/resolve":
                 let input = try #require(JSONSerialization.jsonObject(with: request.httpBody!) as? [String:[[String:Any]]])
-                data = try json(["results":input["releases"]!.map { ["ref":$0["ref"]!, "status":"resolved",
-                                    "contentKind":"single","automationEligible":true,"videoIds":[id.uuidString]] }])
+                data = try json(["results":input["releases"]!.map { release in
+                    let video = (release["title"] as? String)?.hasPrefix("Archive.") == true ? archiveID : id
+                    return ["ref":release["ref"]!, "status":"resolved", "contentKind":"single",
+                            "automationEligible":true,"videoIds":[video.uuidString]] as [String:Any]
+                }])
             case "/videos/identify":
                 let input = try #require(JSONSerialization.jsonObject(with: request.httpBody!) as? [String:Any])
                 let files = try #require(input["files"] as? [[String:Any]])
@@ -48,7 +60,7 @@ private actor MediaAPI {
                     data = try json([["previewImageType":"SpriteSheet","url":"https://example.invalid/sprite"],
                                      ["previewImageType":"Single","url":artwork.absoluteString]])
                 } else {
-                    data = try json(["id":id.uuidString,"title":"Harbor Walk","site":["title":"Studio North"],"images":[]])
+                    data = try json(["id":url.lastPathComponent,"title":url.lastPathComponent == archiveID.uuidString ? "Distant Shore" : "Harbor Walk","site":["title":"Studio North"],"images":[]])
                 }
             }
         } else if url.host == "sab.example.invalid" {
@@ -63,7 +75,7 @@ private actor MediaAPI {
                 if loseReply { throw URLError(.networkConnectionLost) }
                 data = try json(["status":true,"nzo_ids":["SAB-job"]])
             case "queue":
-                let slots = completed || jobName == nil ? [] : [["filename":jobName ?? "", "nzo_id":"SAB-job", "status":"Downloading"]]
+                let slots = completed || jobName == nil ? [] : [["filename":jobName ?? "", "nzo_id":"SAB-job", "status":"Downloading", "percentage":"42.5", "timeleft":"0:03:12"]]
                 data = try json(["queue":["slots":slots]])
             case "history":
                 let name = jobName ?? ""
@@ -77,15 +89,23 @@ private actor MediaAPI {
         } else if value("t") == "get" {
             headers["Content-Type"] = "application/x-nzb"
             headers["Content-Disposition"] = disposition
-            #expect(value("id") == "download-a")
-            data = Data("<nzb><file><segments><segment>sample@example.invalid</segment></segments></file></nzb>".utf8)
+            let id = try #require(value("id"))
+            requestedNZBs.append(id)
+            data = id == invalidNZB ? Data() : Data("<nzb><file><segments><segment>sample@example.invalid</segment></segments></file></nzb>".utf8)
         } else {
             let offset = Int(value("offset") ?? "0") ?? 0
             searches.append(offset)
-            let entry = offset == 0 ? "a" : "older"
+            let term = value("q") ?? ""
+            if term.contains("+") { #expect(url.absoluteString.contains("%2B")) }
+            terms.append(term)
+            let entry = term.isEmpty ? (offset == 0 ? "a" : "older") : "archive-\(offset)"
+            let older4K = include4K && offset > 0
+            let standardRelease = include4K ? "Test.Release.1080p" : "Test.Release"
+            let release = term.isEmpty ? (older4K ? "Test.Release.4K" : standardRelease) : "Archive.Remaster.2160p"
+            let date = term.isEmpty && !older4K ? "2026-11-23T01:00:00Z" : "2020-03-01T01:00:00Z"
             data = Data("""
                 <rss xmlns:n="urn:newznab"><channel><n:response offset="\(offset)" total="2"/>
-                <item><title>Test.Release</title><guid>\(entry)</guid><link>https://index.example.invalid/api?t=get&amp;id=download-\(entry)</link></item>
+                <item><n:attr name="usenetdate" value="\(date)"/><title>\(release)</title><guid>\(entry)</guid><link>https://index.example.invalid/api?t=get&amp;id=download-\(entry)</link></item>
                 </channel></rss>
                 """.utf8)
         }
@@ -111,6 +131,61 @@ struct MediaWorkflowTests {
         let page = try await feed.refresh()
         #expect(page.titles.first?.preview == api.artwork)
         return feed
+    }
+
+    @Test(arguments: [nil, .p2160, .p1080] as [ReleaseQuality?])
+    func automaticDownloadUsesSavedPreference(preference: ReleaseQuality?) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI(include4K: true)
+        let feed = try await setup(api)
+        _ = try await feed.refresh(earlier: true)
+        var config = try #require(try await feed.connections())
+        config.sab?.preferredQuality = preference
+        try await feed.configure(config)
+        let reopened = try LiveFeed(root: root, http: FeedHTTP { try await api.perform($0) })
+        let qualities = try await reopened.cached().titles.first?.offers.compactMap(\.quality)
+        #expect(qualities == (preference == .p1080 ? ["1080p", "2160p"] : ["2160p", "1080p"]))
+        try await reopened.startDownload(api.id)
+        #expect(await api.requestedNZBs == [preference == .p2160 ? "download-older" : "download-a"])
+        #expect(await api.submissions == 1)
+    }
+
+    @Test func manualDownloadIsExactAndOnlyAutomaticSelectionFallsBack() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI(include4K: true)
+        let feed = try await setup(api)
+        let page = try await feed.refresh(earlier: true)
+        let older = try #require(page.titles.first?.offers.first { $0.name == "Test.Release.4K" })
+        await #expect(throws: FeedError.self) { try await feed.startDownload(api.id, offerID: "missing") }
+        #expect(await api.requestedNZBs.isEmpty)
+
+        await api.invalidateNZB("download-older")
+        await #expect(throws: FeedError.self) { try await feed.startDownload(api.id, offerID: older.id) }
+        #expect(await api.requestedNZBs == ["download-older"])
+        #expect(await api.submissions == 0)
+
+        var config = try #require(try await feed.connections())
+        config.sab?.preferredQuality = .p2160
+        try await feed.configure(config)
+        try await feed.startDownload(api.id)
+        #expect(await api.requestedNZBs == ["download-older", "download-older", "download-a"])
+        #expect(await api.submissions == 1)
+    }
+
+    @Test func manualDownloadOverridesQualityPreferenceAndRecordsChosenRelease() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI(include4K: true)
+        let feed = try await setup(api)
+        let page = try await feed.refresh(earlier: true)
+        let newest = try #require(page.titles.first?.offers.first { $0.quality == "1080p" })
+        var config = try #require(try await feed.connections())
+        config.sab?.preferredQuality = .p2160
+        try await feed.configure(config)
+        try await feed.startDownload(api.id, offerID: newest.id)
+        try await feed.startDownload(api.id)
+        #expect(await api.requestedNZBs == ["download-a"])
+        #expect(await api.submissions == 1)
+        #expect(try await feed.transfers().first?.releaseName == newest.name)
     }
 
     @Test func confirmedDownloadRecoversReceiptAndFilesUnderSelectedTitle() async throws {
@@ -162,7 +237,58 @@ struct MediaWorkflowTests {
         try await feed.startDownload(api.id)
         #expect(await api.jobName == "Test.Release")
         try await feed.followDownloads()
-        #expect(try await feed.transfers().first?.state == "Downloading")
+        let job = try #require(try await feed.transfers().first)
+        #expect(job.state == "Downloading")
+        #expect(job.progress == 42.5)
+        #expect(job.timeLeft == "0:03:12")
+        #expect(job.jobName == "Test.Release")
+        await api.finish()
+        try await feed.followDownloads()
+        let received = try #require(try await feed.transfers().first)
+        #expect(received.progress == 100)
+        #expect(received.timeLeft == nil)
+    }
+
+    @Test func indexerSearchHasIndependentPagesAndResultsSurviveRestart() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI()
+        let feed = try await setup(api)
+        let term = "Shore + sea & sand"
+        #expect(CatalogFilter().titles(in: try await feed.cached(), matching: term, search: nil).isEmpty)
+        let first = try await feed.refresh(search: IndexerSearch(term: term))
+        let search = try #require(first.indexerSearch)
+        #expect(search.hasMore)
+        #expect(CatalogFilter().titles(in: first, matching: term, search: search).map(\.id) == [api.archiveID])
+        let second = try await feed.refresh(search: search)
+        #expect(second.indexerSearch?.hasMore == false)
+        #expect(second.indexerSearch?.offerIDs.count == 2)
+        #expect(second.oldestBrowsed == feedDate("2026-11-23T01:00:00Z"))
+        #expect(second.hasEarlier)
+        let reopened = try LiveFeed(root: root, http: FeedHTTP { try await api.perform($0) })
+        let page = try await reopened.refresh(earlier: true)
+        #expect(!page.hasEarlier)
+        #expect(await api.terms == ["",term,term,""])
+        #expect(await api.searches == [0,0,1,1])
+        var filter = CatalogFilter()
+        filter.studio = "Studio North"
+        filter.indexer = "index.example.invalid"
+        filter.quality = "2160p"
+        #expect(filter.titles(in: page, matching: "archive remaster", search: nil).map(\.id) == [api.archiveID])
+        filter.days = 7
+        #expect(filter.titles(in: page, matching: "", search: nil, now: try #require(page.oldestBrowsed)).isEmpty)
+    }
+
+    @Test func olderSearchListingsRemainAvailableForNinetyDays() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI()
+        let feed = try await setup(api)
+        let now = Date.now
+        _ = try await feed.refresh(search: IndexerSearch(term: "shore"), now: now)
+        let afterMonth = try await feed.refresh(now: now.addingTimeInterval(30 * 86400))
+        #expect(afterMonth.titles.contains { $0.id == api.archiveID })
+        let expired = try await feed.refresh(now: now.addingTimeInterval(91 * 86400))
+        #expect(!expired.titles.contains { $0.id == api.archiveID })
+        #expect(expired.hasEarlier)
     }
 
     @Test func earlierUploadsResumeAtProviderOffsetAfterRestart() async throws {

@@ -5,105 +5,39 @@ import LoaderooCore
 struct LiveFeedView: View {
     let openDemo: () -> Void
     @State private var model = FeedWorkspace()
-    @State private var selection: SectionName? = .releases
+    @State private var selection: SectionName = .releases
     @State private var editing = false
     @State private var sabTab = false
-    @State private var detail: FeedTitle?
+    @State private var downloadSelection: String?
+    @State private var downloadQuery = ""
     @State private var search = ""
     @State private var manageFolders = false
+    @State private var windowSize = CGSize(width: 740, height: 450)
 
     var body: some View {
         NavigationSplitView {
             List(SectionName.allCases, selection: $selection) { section in
-                Label(section.rawValue, systemImage: section.symbol)
+                Label(section == .releases ? "Catalog" : section.rawValue, systemImage: section.symbol)
                     .badge(count(section)).tag(section)
             }
-            .navigationSplitViewColumnWidth(min: 148, ideal: 172, max: 230)
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 230)
             .safeAreaInset(edge: .bottom, alignment: .leading) {
-                Button { settings() } label: { Label("Connections", systemImage: "gearshape") }
+                Button("Connections", systemImage: "gearshape") { settings() }
                     .buttonStyle(.plain).padding(16)
             }
         } detail: {
-            VStack(spacing: 0) {
-                let issues = [model.error, model.downloadIssue].compactMap { $0 } + model.page.issues
-                if !issues.isEmpty {
-                    Text(issues.joined(separator: "\n")).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10).background(.quaternary)
-                }
-                if !model.ready {
-                    if model.error == nil { ProgressView("Opening library…") }
-                    else { Button("Retry") { Task { await model.open() } } }
-                } else if model.config == nil {
-                    ContentUnavailableView {
-                        Label("Connect your indexers", systemImage: "antenna.radiowaves.left.and.right")
-                    } description: { Text("Use your PRDB key and Newznab indexers to find recent uploads.") }
-                    actions: {
-                        Button("Set Up Connections…") { settings() }.buttonStyle(.borderedProminent)
-                        Button("Open Local Demo", action: openDemo)
-                    }
-                } else {
-                    switch selection ?? .releases {
-                    case .releases:
-                        feed
-                        HStack {
-                            Text("\(model.page.titles.count) available · \(model.page.pending) awaiting a match").foregroundStyle(.secondary)
-                            Spacer()
-                            if model.page.hasEarlier {
-                                Button("Load Earlier Uploads") { Task { await model.refresh(earlier: true) } }.disabled(model.loading)
-                            }
-                        }.font(.callout).padding(.horizontal,20).padding(.vertical,8).background(.bar)
-                    case .library: library
-                    case .downloads: downloads
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .navigationTitle((selection ?? .releases).rawValue)
-            .toolbar {
-                if model.config != nil {
-                    if model.loading || model.scanning { ProgressView().controlSize(.small) }
-                    if selection == .library {
-                        Button("Manage Folders", systemImage: "folder.badge.gearshape") { manageFolders = true }
-                        Button("Scan Library", systemImage: "arrow.clockwise") { Task { await model.scan() } }.disabled(model.scanning)
-                    } else {
-                        Button("Refresh", systemImage: "arrow.clockwise") {
-                            Task { if selection == .downloads { await model.follow() } else { await model.refresh(manual: true) } }
-                        }.disabled(model.loading)
-                    }
-                }
-            }
-            .searchable(text: $search, placement: .toolbar, prompt: "Search titles or studios")
+            workspace
         }
         .frame(minWidth: 740, minHeight: 450)
+        .environment(\.previewWindowSize, windowSize)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { windowSize = $0 }
         .sheet(isPresented: $editing) {
             ConnectionsForm(downloadSettings: sabTab, draft: model.config ?? FeedConnections()) { config, verifySAB in
                 try await model.save(config, verifySAB: verifySAB)
                 editing = false
                 Task { await model.refresh(manual: true) }
             }
-        }
-        .sheet(item: $detail) { title in
-            VStack(alignment: .leading, spacing: 12) {
-                LiveArtwork(remote: title.preview).aspectRatio(16/9, contentMode: .fit)
-                Text(title.title).font(.title.bold()).textSelection(.enabled)
-                if let studio = title.studio { Text(studio).font(.title3) }
-                LabeledContent("Usenet upload", value: title.posted?.formatted() ?? "Unknown")
-                LabeledContent("Indexers", value: title.sources.joined(separator: ", "))
-                if !title.qualities.isEmpty { LabeledContent("Quality", value: title.qualities.joined(separator: ", ")) }
-                DisclosureGroup("Usenet releases (\(title.offers.count))") {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(title.offers) { offer in
-                                Text(offer.name).font(.callout).textSelection(.enabled)
-                                Text([offer.source, offer.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }]
-                                    .compactMap { $0 }.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }.frame(maxWidth: .infinity,alignment: .leading)
-                    }.frame(maxHeight: 100)
-                }
-                Divider()
-                HStack { Button("Done") { detail = nil }.keyboardShortcut(.cancelAction); Spacer(); downloadButton(title) }
-            }.padding(24).frame(width: 520)
         }
         .sheet(isPresented: $manageFolders) { folderSheet }
         .task {
@@ -123,7 +57,82 @@ struct LiveFeedView: View {
         }
     }
 
-    private func settings(sab: Bool = false) { sabTab = sab; detail = nil; editing = true }
+    private var workspace: some View {
+        VStack(spacing: 0) {
+            let issues = [model.error, model.downloadIssue].compactMap { $0 } + model.page.issues
+            if !issues.isEmpty {
+                Text(issues.joined(separator: "\n")).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10).background(.quaternary)
+            }
+            if !model.ready {
+                if model.error == nil { ProgressView("Opening library…") }
+                else { Button("Retry") { Task { await model.open() } } }
+            } else if model.config == nil {
+                ContentUnavailableView {
+                    Label("Connect your indexers", systemImage: "antenna.radiowaves.left.and.right")
+                } description: { Text("Use your PRDB key and Newznab indexers to find recent uploads.") }
+                actions: {
+                    Button("Set Up Connections…") { settings() }.buttonStyle(.borderedProminent)
+                    Button("Open Local Demo", action: openDemo)
+                }
+            } else {
+                switch selection {
+                case .releases:
+                    CatalogView(model: model, controls: { searchControls }, download: downloadButton)
+                case .library:
+                    HStack {
+                        Button("Manage Folders", systemImage: "folder.badge.gearshape") { manageFolders = true }
+                        Spacer()
+                        searchControls
+                    }.padding(.horizontal, 18).padding(.vertical, 9)
+                    Divider()
+                    library.frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .downloads:
+                    DownloadsView(model: model, query: downloadQuery, selection: $downloadSelection, controls: { searchControls }) { title in
+                        downloadButton(title, nil)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+        .navigationTitle(selection == .releases ? "Release catalog" : selection.rawValue)
+    }
+
+    private var searchControls: some View {
+        HStack(spacing: 8) {
+            WorkspaceSearchField(text: searchBinding, prompt: searchPrompt) {
+                guard selection == .releases else { return }
+                let search = IndexerSearch(term: model.catalogQuery)
+                if !search.term.isEmpty { Task { await model.refresh(search: search) } }
+            }
+            Button {
+                Task {
+                    switch selection {
+                    case .downloads: await model.follow()
+                    case .library: await model.scan()
+                    case .releases: await model.refresh(manual: true)
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .opacity(refreshing ? 0 : 1)
+                    .overlay { if refreshing { ProgressView().controlSize(.small) } }
+            }
+            .accessibilityLabel(selection == .library ? "Scan Library" : "Refresh")
+            .help(selection == .library ? "Scan Library" : "Refresh")
+            .disabled(refreshing)
+        }
+    }
+
+    private var refreshing: Bool {
+        switch selection {
+        case .releases: model.loading
+        case .downloads: model.following
+        case .library: model.scanning
+        }
+    }
+
+    private func settings(sab: Bool = false) { sabTab = sab; editing = true }
     private func count(_ section: SectionName) -> Int {
         switch section {
         case .releases: model.page.titles.count
@@ -135,54 +144,34 @@ struct LiveFeedView: View {
         let paths = Set(model.files.map(\.path))
         return model.jobs.filter { $0.state == "Completed" && !paths.contains($0.localPath ?? "") }
     }
+    private var searchBinding: Binding<String> {
+        switch selection {
+        case .downloads: $downloadQuery
+        case .library: $search
+        default: Binding(get: { model.catalogQuery }, set: { model.catalogQuery = $0 })
+        }
+    }
+    private var searchPrompt: String {
+        switch selection {
+        case .downloads: "Search downloads or paths"
+        case .library: "Search your library"
+        default: "Search titles, studios or releases"
+        }
+    }
     private func includes(_ parts: String?...) -> Bool {
         search.isEmpty || parts.compactMap { $0 }.joined(separator: " ").localizedCaseInsensitiveContains(search)
     }
 
-    @ViewBuilder private func downloadButton(_ title: FeedTitle) -> some View {
-        if let job = model.jobs.first(where: { $0.video == title.id.uuidString }), !job.retryable {
-            Button("View Download") { detail = nil; selection = .downloads }
+    @ViewBuilder private func downloadButton(_ title: FeedTitle, _ offer: FeedOffer?) -> some View {
+        if let job = model.activeJob(for: title) {
+            Button("View Download") { downloadSelection = job.id; downloadQuery = ""; selection = .downloads }
         } else {
             Button {
                 if model.config?.sab == nil { settings(sab: true) }
-                else { Task { await model.download(title) } }
+                else { Task { await model.download(title, offerID: offer?.id) } }
             } label: { Label("Download", systemImage: "arrow.down.to.line") }
             .disabled(model.sending.contains(title.id))
-        }
-    }
-
-    private var feed: some View {
-        let titles = model.page.titles.filter { includes($0.title,$0.studio,$0.sources.joined(separator: " ")) }
-        return Group {
-            if titles.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "No new matched uploads" : "No matching titles", systemImage: "rectangle.stack",
-                                       description: Text(search.isEmpty ? "\(model.page.pending) uploads await another PRDB check." : "Try another title or studio."))
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(titles) { title in
-                            HStack(spacing: 16) {
-                                Button { detail = title } label: {
-                                    LiveArtwork(remote: title.preview).frame(width: 148,height: 84)
-                                }.buttonStyle(.plain).accessibilityLabel("Details for " + title.title)
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Button { detail = title } label: {
-                                        Text(title.title).font(.headline).lineLimit(2).multilineTextAlignment(.leading)
-                                    }.buttonStyle(.plain)
-                                    if let studio = title.studio { Text(studio).foregroundStyle(.secondary) }
-                                    let metadata: [String?] = [title.posted?.formatted(date: .abbreviated,time: .omitted),
-                                                    title.qualities.joined(separator: " · "),title.sources.joined(separator: ", ")]
-                                    Text(metadata.compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "  ·  "))
-                                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                }
-                                Spacer(minLength: 0)
-                                downloadButton(title)
-                            }.padding(.vertical,12)
-                            Divider()
-                        }
-                    }.padding(.horizontal,20)
-                }
-            }
+            .accessibilityLabel(offer.map { "Download \($0.name) from \($0.source)" } ?? "Download \(title.title)")
         }
     }
 
@@ -221,29 +210,6 @@ struct LiveFeedView: View {
     }
     private func reveal(_ path: String) { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: path)]) }
 
-    @ViewBuilder private var downloads: some View {
-        let jobs = model.jobs.filter { includes($0.title,$0.studio,$0.provider) }
-        if jobs.isEmpty {
-            ContentUnavailableView("No downloads here", systemImage: "arrow.down.circle", description: Text("Choose Download next to a title in Recent uploads."))
-        } else {
-            List(jobs) { job in
-                HStack(alignment: .top, spacing: 12) {
-                    LiveArtwork(remote: job.image.flatMap(URL.init(string:))).frame(width: 112,height: 63)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(job.title).font(.headline)
-                        Text([job.state, job.provider].joined(separator: " · ")).foregroundStyle(.secondary)
-                        if let release = job.releaseName { Text(release).font(.caption).lineLimit(2).textSelection(.enabled) }
-                        if let note = job.note { Text(note).font(.callout) }
-                        if let path = job.localPath ?? job.storage { Text(path).font(.caption).textSelection(.enabled) }
-                    }
-                    Spacer()
-                    if let path = job.localPath { Button("Show in Finder") { reveal(path) } }
-                    if job.retryable, let title = model.page.titles.first(where: { $0.id.uuidString == job.video }) { downloadButton(title) }
-                }.padding(.vertical,5)
-            }
-        }
-    }
-
     private var folderSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Library folders").font(.title2.bold())
@@ -281,6 +247,12 @@ struct LiveArtwork: View {
             AsyncImage(url: remote) { phase in
                 if let image = phase.image { image.resizable().scaledToFit() }
                 else if let still { Image(nsImage: still).resizable().scaledToFit() }
+                else if phase.error != nil {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.secondary).help("Preview failed to load")
+                        .accessibilityLabel("Preview failed to load")
+                }
+                else if remote != nil { ProgressView().controlSize(.small).accessibilityLabel("Loading preview") }
                 else { Image(systemName: "film").font(.title2).foregroundStyle(.tertiary).accessibilityLabel("Preview unavailable") }
             }
         }.clipShape(RoundedRectangle(cornerRadius: 7))

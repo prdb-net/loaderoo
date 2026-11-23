@@ -5,6 +5,7 @@ public struct SABConnection: Codable, Equatable, Sendable {
     public var address = ""
     public var apiKey = ""
     public var category = ""
+    public var preferredQuality: ReleaseQuality?
     public var remoteRoot = "/downloads/complete"
     public var mount = ""
     public var destination = ""
@@ -46,13 +47,25 @@ public struct Transfer: Decodable, FetchableRecord, Identifiable, Sendable {
     public let video, title, provider, state: String
     let endpoint, token: String
     public let studio, image, job, note, storage, localPath, releaseName: String?
+    public let jobName, timeLeft: String?
+    public let progress: Double?
     public var id: String { video }
     public var retryable: Bool { state == "Rejected" || state == "Failed" }
 }
 
+private struct SABPercentage: Decodable {
+    let value: Double?
+    init(from decoder: Decoder) throws {
+        let field = try decoder.singleValueContainer()
+        let number = (try? field.decode(Double.self)) ?? (try? field.decode(String.self)).flatMap(Double.init)
+        value = number.flatMap { (0...100).contains($0) ? $0 : nil }
+    }
+}
+
 private struct SABSlot: Decodable {
     let nzo_id: String
-    let filename, name, nzb_name, status, storage: String?
+    let filename, name, nzb_name, status, storage, timeleft, fail_message: String?
+    let percentage: SABPercentage?
 }
 
 private struct SABEnvelope: Decodable {
@@ -76,27 +89,42 @@ extension LiveFeed {
         try store.read { try Transfer.fetchAll($0, sql: "SELECT t.*,s.releaseName FROM transfer t LEFT JOIN transferSource s ON s.video=t.video ORDER BY t.created DESC") }
     }
 
-    public func startDownload(_ id: UUID) async throws {
+    public func startDownload(_ id: UUID, offerID: String? = nil) async throws {
         guard let config = try connections(), let sab = config.sab else { throw FeedError("Set up SABnzbd in Connections first.") }
         let raw = id.uuidString
         if let job = try transfers().first(where: { $0.video == raw }), !job.retryable { return }
         guard let title = try cached().titles.first(where: { $0.id == id }) else { throw FeedError("The video is already owned or unavailable.") }
         let offers = try await store.read { db in
-            try Row.fetchAll(db, sql: "SELECT source,payload FROM offer WHERE video=?", arguments: [raw]).compactMap { row -> (IndexerConnection, Upload)? in
+            var query = "SELECT source,payload FROM offer WHERE video=?"
+            var arguments: StatementArguments = [raw]
+            if let offerID {
+                query += " AND ref=?"
+                arguments += [offerID]
+            }
+            return try Row.fetchAll(db, sql: query, arguments: arguments).compactMap { row -> (IndexerConnection, Upload)? in
                 guard let provider = config.indexers.first(where: { $0.id.uuidString == row["source"] as String }) else { return nil }
                 return (provider, try JSONDecoder().decode(Upload.self, from: row["payload"]))
             }.sorted { a,b in
+                if let preferred = sab.preferredQuality {
+                    let prefersA = a.1.releaseQuality == preferred
+                    let prefersB = b.1.releaseQuality == preferred
+                    if prefersA != prefersB { return prefersA }
+                }
                 let keyA = (a.1.posted ?? .distantPast, a.1.size ?? 0)
                 let keyB = (b.1.posted ?? .distantPast, b.1.size ?? 0)
                 if keyA != keyB { return keyA > keyB }
                 return (a.0.id.uuidString, a.1.entry) < (b.0.id.uuidString, b.1.entry)
             }
         }
+        if offerID != nil && offers.isEmpty { throw FeedError("The selected release is no longer available.") }
         var selected: (provider: String, upload: Upload, nzb: Data, jobName: String)?
         var lastError: Error = FeedError("The indexers have no usable NZB for this title.")
         for (provider, upload) in offers {
             try Task.checkCancellation()
-            guard try clock(for: provider.id.uuidString, now: .now, includePoll: false) else { continue }
+            guard try clock(for: provider.id.uuidString, now: .now, includePoll: false) else {
+                if offerID != nil { throw FeedError("\(provider.name) is waiting to retry. Try again later or choose another release.") }
+                continue
+            }
             var url = try provider.endpoint
             url.append(queryItems: [.init(name: "t", value: "get"), .init(name: "id", value: upload.downloadID ?? upload.entry),
                                     .init(name: "apikey", value: provider.apiKey)])
@@ -118,9 +146,9 @@ extension LiveFeed {
         let reserved = try await store.write { db in
             try db.execute(sql: "DELETE FROM transfer WHERE video=? AND state IN ('Failed','Rejected')", arguments: [raw])
             try db.execute(sql: """
-                INSERT OR IGNORE INTO transfer(video,title,studio,image,provider,endpoint,token,state,created)
-                SELECT ?,?,?,?,?,?,?,'Submitting',? WHERE NOT EXISTS(SELECT 1 FROM libraryFile WHERE video=?)
-                """, arguments: [raw,title.title,title.studio,title.preview?.absoluteString,provider,endpoint,token,Date.now.timeIntervalSince1970,raw])
+                INSERT OR IGNORE INTO transfer(video,title,studio,image,provider,endpoint,token,state,created,jobName)
+                SELECT ?,?,?,?,?,?,?,'Submitting',?,? WHERE NOT EXISTS(SELECT 1 FROM libraryFile WHERE video=?)
+                """, arguments: [raw,title.title,title.studio,title.preview?.absoluteString,provider,endpoint,token,Date.now.timeIntervalSince1970,jobName,raw])
             guard db.changesCount == 1 else { return false }
             try db.execute(sql: "INSERT OR REPLACE INTO transferSource VALUES (?,?,?)", arguments: [raw,upload.entry,upload.title])
             return true
@@ -161,9 +189,10 @@ extension LiveFeed {
         return component(stem)
     }
 
-    private func update(_ id: String, state: String, job: String? = nil, note: String? = nil, storage: String? = nil) throws {
-        try store.write { try $0.execute(sql: "UPDATE transfer SET state=?,job=COALESCE(?,job),note=?,storage=COALESCE(?,storage) WHERE video=? AND storage IS NULL",
-                                        arguments: [state,job,note,storage,id]) }
+    private func update(_ id: String, state: String, job: String? = nil, note: String? = nil, storage: String? = nil,
+                        name: String? = nil, progress: Double? = nil, timeLeft: String? = nil) throws {
+        try store.write { try $0.execute(sql: "UPDATE transfer SET state=?,job=COALESCE(?,job),note=?,storage=COALESCE(?,storage),jobName=COALESCE(?,jobName),progress=?,timeLeft=? WHERE video=? AND storage IS NULL",
+                                        arguments: [state,job,note,storage,name,progress,timeLeft,id]) }
     }
 
     private func resolveMissingStudios(_ config: FeedConnections, sab: SABConnection) async throws {
@@ -202,9 +231,12 @@ extension LiveFeed {
                 let state = hit.status ?? "Queued"
                 if mode == "history", state == "Completed" {
                     guard let path = hit.storage, !path.isEmpty else { throw FeedError("SABnzbd history has no completion path.") }
-                    try update(item.id, state: "Downloaded", job: hit.nzo_id, storage: path)
+                    try update(item.id, state: "Downloaded", job: hit.nzo_id, storage: path, name: hit.name, progress: 100)
                 } else {
-                    try update(item.id, state: state == "Completed" ? "Processing" : state, job: hit.nzo_id)
+                    try update(item.id, state: state == "Completed" ? "Processing" : state, job: hit.nzo_id,
+                               note: state == "Failed" ? hit.fail_message : nil,
+                               name: hit.name ?? hit.filename, progress: hit.percentage?.value,
+                               timeLeft: mode == "queue" && state == "Downloading" ? hit.timeleft : nil)
                 }
             } else {
                 try update(item.id, state: "Checking receipt", note: "Waiting for the job in SABnzbd.")

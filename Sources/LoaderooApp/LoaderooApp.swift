@@ -15,7 +15,6 @@ struct LoaderooApp: App {
                 LiveFeedView(openDemo: { demo = true })
             }
         }
-        .defaultSize(width: 900, height: 620)
         .commands {
             CommandMenu("Workspace") {
                 Button(demo ? "Open Live Feed" : "Open Local Demo") { demo.toggle() }
@@ -24,7 +23,23 @@ struct LoaderooApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NotificationCenter.default.addObserver(self, selector: #selector(sizeInitialWindow(_:)),
+                                               name: NSWindow.didBecomeMainNotification, object: nil)
+    }
+
+    @objc private func sizeInitialWindow(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, !(window is NSPanel),
+              let screen = window.screen else { return }
+        // Size the workspace once, on the display macOS chose when restoring the window.
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeMainNotification, object: nil)
+        if !window.styleMask.contains(.fullScreen) {
+            window.setFrame(screen.visibleFrame, display: true)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)

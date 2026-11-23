@@ -1,5 +1,26 @@
 import Foundation
 
+public enum ReleaseQuality: String, CaseIterable, Codable, Sendable {
+    case p4320 = "4320p", p2160 = "2160p", p1080 = "1080p", i1080 = "1080i"
+    case p720 = "720p", p576 = "576p", p540 = "540p", p480 = "480p"
+
+    public var label: String {
+        switch self {
+        case .p4320: "8K (4320p)"
+        case .p2160: "4K (2160p)"
+        default: rawValue
+        }
+    }
+
+    fileprivate init?(tag: String) {
+        switch tag {
+        case "8k": self = .p4320
+        case "4k": self = .p2160
+        default: self.init(rawValue: tag)
+        }
+    }
+}
+
 struct Upload: Codable, Equatable, Sendable {
     let entry: String
     let title: String
@@ -8,11 +29,13 @@ struct Upload: Codable, Equatable, Sendable {
     let categories: [String]
     var downloadID: String? = nil
 
-    var quality: String? {
+    var releaseQuality: ReleaseQuality? {
         let name = title.lowercased()
         let tags = name.components(separatedBy: CharacterSet.alphanumerics.inverted)
-        return tags.first { ["480p", "540p", "576p", "720p", "1080p", "1080i", "2160p", "4k", "8k"].contains($0) }
+        return tags.lazy.compactMap(ReleaseQuality.init(tag:)).first
     }
+
+    var quality: String? { releaseQuality?.rawValue }
 }
 
 struct NewznabFeed {
@@ -27,16 +50,22 @@ struct NewznabFeed {
         let next: Int?
     }
 
-    func page(_ connection: IndexerConnection, offset: Int) async throws -> Page {
-        var url = try connection.endpoint
+    func page(_ connection: IndexerConnection, offset: Int, term: String? = nil) async throws -> Page {
+        let url = try connection.endpoint
         var query = [URLQueryItem(name: "t", value: "search"), .init(name: "o", value: "xml"),
                      .init(name: "limit", value: "100"),
                      .init(name: "attrs", value: "usenetdate,category,size,password,guid")]
+        if let term { query.append(.init(name: "q", value: term)) }
         if offset > 0 { query.append(.init(name: "offset", value: String(offset))) }
         if !connection.apiKey.isEmpty { query.append(.init(name: "apikey", value: connection.apiKey)) }
         if !connection.categories.isEmpty { query.append(.init(name: "cat", value: connection.categories)) }
-        url.append(queryItems: query)
-        return try RSSReader.read(await http.data(URLRequest(url: url)), offset: offset)
+        var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        parts?.queryItems = query
+        // Newznab servers commonly decode query parameters as form data.
+        let encoded = parts?.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        parts?.percentEncodedQuery = encoded
+        guard let requestURL = parts?.url else { throw FeedError("Invalid indexer search URL.") }
+        return try RSSReader.read(await http.data(URLRequest(url: requestURL)), offset: offset)
     }
 }
 
