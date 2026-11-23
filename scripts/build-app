@@ -11,6 +11,7 @@ app="$stage/Loaderoo.app"
 contents="$app/Contents"
 mkdir -p "$contents/MacOS" "$contents/Resources"
 cp Packaging/Info.plist "$contents/"
+cp Packaging/Loaderoo.icns "$contents/Resources/"
 cp "$products/Loaderoo" "$contents/MacOS/"
 for bundle in "$products"/*.bundle; do
     ditto "$bundle" "$contents/Resources/$(basename "$bundle")"
