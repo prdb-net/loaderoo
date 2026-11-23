@@ -3,10 +3,11 @@ import SwiftUI
 import LoaderooCore
 
 private enum LiveSection: String, CaseIterable, Identifiable {
-    case releases = "Catalog", studios = "Studios", actors = "Actors", downloads = "Downloads", library = "Library"
+    case releases = "Catalog", prdb = "PRDB videos", studios = "Studios", actors = "Actors", downloads = "Downloads", library = "Library"
     var id: Self { self }
     var symbol: String {
         switch self {
+        case .prdb: "film.stack"
         case .studios: DirectoryKind.studios.symbol
         case .actors: DirectoryKind.actors.symbol
         case .downloads: SectionName.downloads.symbol
@@ -20,7 +21,7 @@ struct LiveFeedView: View {
     let openDemo: () -> Void
     @State private var model = FeedWorkspace()
     @State private var selection: LiveSection = .releases
-    @State private var subject: CatalogSubject?
+    @State private var profileVisit: ProfileVisit?
     @State private var editing = false
     @State private var sabTab = false
     @State private var downloadSelection: String?
@@ -32,7 +33,7 @@ struct LiveFeedView: View {
     var body: some View {
         NavigationSplitView {
             List(LiveSection.allCases, selection: Binding(get: { selection }, set: {
-                subject = nil
+                profileVisit = nil
                 selection = $0
             })) { section in
                 Label(section.rawValue, systemImage: section.symbol)
@@ -69,8 +70,13 @@ struct LiveFeedView: View {
                 do { try await Task.sleep(for: .seconds(10)) } catch { break }
                 tick += 1
                 if model.jobs.contains(where: { !$0.retryable && $0.state != "Completed" || $0.state == "Completed" && $0.studio == nil && tick.isMultiple(of: 90) }) { await model.follow() }
-                if tick.isMultiple(of: 6), !editing { await model.refresh() }
                 if tick.isMultiple(of: 8640), !model.folders.isEmpty { await model.scan() }
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(60)) } catch { break }
+                if !editing { await model.maintainCatalog() }
             }
         }
     }
@@ -97,8 +103,15 @@ struct LiveFeedView: View {
                 switch selection {
                 case .releases:
                     CatalogView(model: model, openProfile: openProfile, controls: { searchControls }, download: downloadButton)
+                case .prdb:
+                    PRDBVideosView(model: model) { title in
+                        model.catalogQuery = title
+                        model.selectedRelease = nil
+                        selection = .releases
+                        Task { await model.refresh(search: IndexerSearch(term: title)) }
+                    }
                 case .actors, .studios:
-                    CatalogDirectoryView(model: model, kind: selection == .actors ? .actors : .studios, subject: $subject,
+                    CatalogDirectoryView(model: model, kind: selection == .actors ? .actors : .studios, visit: $profileVisit,
                                          openProfile: openProfile, download: downloadButton).id(selection)
                 case .library:
                     HStack {
@@ -131,7 +144,7 @@ struct LiveFeedView: View {
                     switch selection {
                     case .downloads: await model.follow()
                     case .library: await model.scan()
-                    case .releases, .actors, .studios: await model.refresh(manual: true)
+                    case .releases, .prdb, .actors, .studios: await model.refresh(manual: true)
                     }
                 }
             } label: {
@@ -147,20 +160,21 @@ struct LiveFeedView: View {
 
     private var refreshing: Bool {
         switch selection {
-        case .releases, .actors, .studios: model.loading
+        case .releases, .prdb, .actors, .studios: model.loading
         case .downloads: model.following
         case .library: model.scanning
         }
     }
 
     private func settings(sab: Bool = false) { sabTab = sab; editing = true }
-    private func openProfile(_ target: CatalogSubject) {
-        selection = target.kind == .actors ? .actors : .studios
-        subject = target
+    private func openProfile(_ visit: ProfileVisit) {
+        selection = visit.subject.kind == .actors ? .actors : .studios
+        profileVisit = visit
     }
 
     private func count(_ section: LiveSection) -> Int {
         switch section {
+        case .prdb: model.reference.videoCount
         case .actors: model.actors.count
         case .studios: model.studios.count
         case .releases: model.page.titles.count

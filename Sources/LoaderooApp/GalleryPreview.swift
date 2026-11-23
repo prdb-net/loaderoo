@@ -42,7 +42,6 @@ struct GalleryPreview: View {
     let sheet: PreviewSheet?
     @Binding var selected: URL?
     @Environment(\.displayScale) private var displayScale
-    @Environment(\.previewWindowSize) private var windowSize
     @State private var loaded: (source: GallerySource, image: CGImage)?
     @State private var failed: GallerySource?
     @State private var enlarged = false
@@ -117,6 +116,32 @@ struct GalleryPreview: View {
     }
 
     private var viewer: some View {
+        PhotoDialog(title: title, urls: urls, selected: $selected) {
+            GeometryReader { area in
+                ZStack {
+                    if let image {
+                        photo(image)
+                            .frame(width: min(area.size.width, CGFloat(image.width) / displayScale),
+                                   height: min(area.size.height, CGFloat(image.height) / displayScale))
+                    } else {
+                        placeholder
+                    }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+}
+
+struct PhotoDialog<Content: View>: View {
+    let title: String
+    let urls: [URL]
+    @Binding var selected: URL?
+    @ViewBuilder let content: () -> Content
+    @Environment(\.previewWindowSize) private var windowSize
+    @Environment(\.dismiss) private var dismiss
+    private var index: Int { selected.flatMap { urls.firstIndex(of: $0) } ?? 0 }
+
+    var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Text(title).font(.headline).lineLimit(1)
@@ -128,21 +153,11 @@ struct GalleryPreview: View {
                     Button("Next image", systemImage: "chevron.right") { selected = urls[index + 1] }
                         .disabled(index + 1 >= urls.count).keyboardShortcut(.rightArrow, modifiers: [])
                 }
-                Button("Close preview", systemImage: "xmark.circle.fill") { enlarged = false }
+                Button("Close preview", systemImage: "xmark.circle.fill") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }.labelStyle(.iconOnly).buttonStyle(.borderless).padding(14)
             Divider()
-            GeometryReader { area in
-                ZStack {
-                    if let image {
-                        photo(image)
-                            .frame(width: min(area.size.width, CGFloat(image.width) / displayScale),
-                                   height: min(area.size.height, CGFloat(image.height) / displayScale))
-                    } else {
-                        placeholder
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }.padding(12)
+            content().padding(12)
         }
         .frame(width: max(320, windowSize.width - 32), height: max(200, windowSize.height - 48))
     }

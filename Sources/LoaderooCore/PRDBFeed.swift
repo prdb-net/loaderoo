@@ -56,8 +56,18 @@ struct PRDBFeed {
     let http: FeedHTTP
     private let base = URL(string: "https://api.prdb.net")!
 
-    func fetch<T: Decodable>(_ path: String, key: String, body: Data? = nil) async throws -> T {
-        var request = URLRequest(url: base.appending(path: path))
+    func fetch<T: Decodable>(_ path: String, key: String, body: Data? = nil, query: [URLQueryItem] = []) async throws -> T {
+        var url = base.appending(path: path)
+        if !query.isEmpty {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.queryItems = query
+            // Preserve the plus in time-zone offsets when the server decodes query parameters.
+            let encoded = components?.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+            components?.percentEncodedQuery = encoded
+            guard let endpoint = components?.url else { throw FeedError("Invalid PRDB query.") }
+            url = endpoint
+        }
+        var request = URLRequest(url: url)
         request.setValue(key, forHTTPHeaderField: "X-Api-Key")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body {
@@ -109,7 +119,7 @@ struct PRDBFeed {
         var usableURL: URL? { PRDBFeed.imageURL(url) }
     }
 
-    private static func imageURL(_ raw: String?) -> URL? {
+    static func imageURL(_ raw: String?) -> URL? {
         guard let raw, let url = URL(string: raw), url.scheme?.lowercased() == "https",
               url.host?.isEmpty == false, url.user == nil, url.password == nil else { return nil }
         return url

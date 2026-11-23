@@ -3,12 +3,13 @@ import LoaderooCore
 
 struct CatalogView<Controls: View, Action: View>: View {
     let model: FeedWorkspace
-    let openProfile: (CatalogSubject) -> Void
+    let openProfile: (ProfileVisit) -> Void
     @ViewBuilder let controls: () -> Controls
     @ViewBuilder let download: (FeedTitle, FeedOffer?) -> Action
     @AppStorage("catalogListLayout") private var listLayout = false
     @AppStorage("catalogOnlyWithPreview") private var onlyWithPreview = true
     @State private var filtering = false
+    @State private var showingHistory = false
     private var filter: CatalogFilter { model.catalogFilter }
     private var selected: UUID? {
         get { model.selectedRelease }
@@ -49,8 +50,11 @@ struct CatalogView<Controls: View, Action: View>: View {
                 }
             Divider()
             ViewThatFits(in: .horizontal) {
-                HStack { status(titles.count); Spacer(); paging }
-                VStack(alignment: .leading, spacing: 5) { status(titles.count); paging }
+                HStack { status(titles.count); Spacer(); historyButton; paging }
+                VStack(alignment: .leading, spacing: 5) {
+                    status(titles.count)
+                    HStack { historyButton; paging }
+                }
             }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 16).padding(.vertical, 8)
         }
         .frame(minHeight: 0, maxHeight: .infinity)
@@ -82,17 +86,22 @@ struct CatalogView<Controls: View, Action: View>: View {
             }.frame(maxHeight: .infinity)
         } else {
             let column = GridItem(listLayout ? .flexible() : .adaptive(minimum: 192), spacing: 16, alignment: .top)
-            ScrollView {
-                LazyVGrid(columns: [column], alignment: .leading, spacing: listLayout ? 0 : 22) {
-                    ForEach(titles) { title in
-                        entry(title)
-                            .id(title.id)
-                            .onAppear {
-                                if title.id == titles.last?.id { loadMore() }
-                            }
-                    }
-                }.scrollTargetLayout().padding(listLayout ? 12 : 18)
-            }.scrollPosition(id: $scrollAnchor, anchor: .top)
+            GeometryReader { viewport in
+                let viewportHeight = viewport.size.height
+                ScrollView {
+                    LazyVGrid(columns: [column], alignment: .leading, spacing: listLayout ? 0 : 22) {
+                        ForEach(titles) { title in entry(title).id(title.id) }
+                    }.scrollTargetLayout().padding(listLayout ? 12 : 18)
+                        .onGeometryChange(for: Bool.self) { geometry in
+                            let bounds = geometry.frame(in: .named("catalogViewport"))
+                            return bounds.height > viewportHeight && bounds.minY < -1
+                                && bounds.maxY <= viewportHeight + 1
+                        } action: { reachedEnd in
+                            if reachedEnd { loadMore() }
+                        }
+                }.coordinateSpace(name: "catalogViewport")
+                    .scrollPosition(id: $scrollAnchor, anchor: .top)
+            }
         }
     }
 
@@ -128,11 +137,43 @@ struct CatalogView<Controls: View, Action: View>: View {
     }
 
     private func status(_ count: Int) -> some View {
-        let extent = model.page.oldestBrowsed.map { "Browsed to " + $0.formatted(date: .abbreviated, time: .omitted) }
-            ?? "\(model.page.releaseCount) releases loaded"
         let matches = count == model.page.titles.count ? "\(count) titles" : "\(count) of \(model.page.titles.count) titles"
-        let parts = [matches, "\(model.page.pending) awaiting a match", extent]
+        let parts = [matches, "\(model.page.pending) awaiting a match", "\(model.page.releaseCount) releases loaded"]
         return Text(parts.joined(separator: "  ·  ")).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var historyButton: some View {
+        Button("Indexer progress") { showingHistory = true }
+            .popover(isPresented: $showingHistory) {
+                ViewThatFits(in: .vertical) {
+                    historyList
+                    ScrollView { historyList }.frame(maxHeight: 300)
+                }.padding(14).frame(width: 320)
+            }
+    }
+
+    private var historyList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Indexer progress").font(.headline)
+            ForEach(model.page.history) { source in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(source.name).fontWeight(.medium)
+                    Text(historyDescription(source)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func historyDescription(_ source: IndexerHistory) -> String {
+        let extent = source.through.map { "Through " + $0.formatted(date: .abbreviated, time: .omitted) }
+            ?? "\(source.pages) of \(IndexerHistory.pageLimit) older pages"
+        switch source.status {
+        case .awaitingFirstPage: return "Waiting for first page"
+        case .moreAvailable: return extent
+        case .endOfResults: return source.through == nil ? "End of results" : "\(extent) · End of results"
+        case .lookbackReached: return "\(extent) · \(IndexerHistory.dayLimit)-day limit reached"
+        case .pageLimitReached: return "\(source.pages) older pages · Automatic page limit reached"
+        }
     }
 
     @ViewBuilder private var paging: some View {
@@ -209,7 +250,7 @@ struct CatalogView<Controls: View, Action: View>: View {
 struct CatalogDetail<Action: View>: View {
     let title: FeedTitle
     let engine: LiveFeed?
-    let openProfile: (CatalogSubject) -> Void
+    let openProfile: (ProfileVisit) -> Void
     let hasDownload: Bool
     @ViewBuilder let action: (FeedOffer?) -> Action
 
@@ -218,9 +259,17 @@ struct CatalogDetail<Action: View>: View {
             CatalogGallery(title: title, engine: engine)
             Text(title.title).font(.title2.bold()).textSelection(.enabled)
             if let studio = CatalogSubject(studioOf: title) {
-                Button(studio.name) { openProfile(studio) }.buttonStyle(.link)
+                Button(studio.name) { openProfile(ProfileVisit(subject: studio, openedVideo: title.id)) }.buttonStyle(.link)
             }
-            if !title.cast.isEmpty { CatalogCast(members: title.cast, openProfile: openProfile) }
+            if let released = title.releaseDate {
+                let style = Date.FormatStyle(date: .abbreviated, time: .omitted, timeZone: .gmt)
+                Text("Released " + released.formatted(style)).font(.callout).foregroundStyle(.secondary)
+            }
+            if !title.cast.isEmpty {
+                CatalogCast(members: title.cast) { actor in
+                    openProfile(ProfileVisit(subject: actor, openedVideo: title.id))
+                }
+            }
             if hasDownload { action(nil) }
             Divider()
             Text("Usenet releases (\(title.offers.count))").font(.headline)

@@ -24,6 +24,10 @@ public struct FeedTitle: Identifiable, Sendable {
     public let sources: [String]
     public let qualities: [String]
     public let offers: [FeedOffer]
+
+    static func newestUploadFirst(_ lhs: Self, _ rhs: Self) -> Bool {
+        (lhs.posted ?? .distantPast, lhs.id.uuidString) > (rhs.posted ?? .distantPast, rhs.id.uuidString)
+    }
 }
 
 public struct IndexerSearch: Sendable {
@@ -42,11 +46,13 @@ public struct FeedPage: Sendable {
     public var pending = 0
     public var hasEarlier = false
     public var oldestBrowsed: Date?
+    public var history: [IndexerHistory] = []
     public var indexerSearch: IndexerSearch?
     public init() {}
 }
 
 public actor LiveFeed {
+    private static let recentPollInterval: TimeInterval = 900
     let store: DatabaseQueue
     private let newznab: NewznabFeed
     let prdb: PRDBFeed
@@ -54,7 +60,7 @@ public actor LiveFeed {
     var scanning = false
     var receiptHistoryUpdates: [String: Int] = [:]
     var polling = false
-    private var busy = false
+    var busy = false
     private var previewRequests: [UUID: Task<UserPreviews, Error>] = [:]
 
     public init(root: URL) throws {
@@ -93,8 +99,10 @@ public actor LiveFeed {
                 CREATE TABLE IF NOT EXISTS studioRetry(video TEXT PRIMARY KEY,checked DOUBLE NOT NULL);
                 CREATE TABLE IF NOT EXISTS staging(video TEXT PRIMARY KEY,path TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS filing(video TEXT PRIMARY KEY,plan BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS actorProfileCache(id TEXT PRIMARY KEY,payload BLOB,checked REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS previewUpgrade(version INTEGER PRIMARY KEY);
                 """)
+            try PRDBCatalog.createTables(db)
             if try !db.columns(in: "paging").contains(where: { $0.name == "oldest" }) {
                 try db.execute(sql: "ALTER TABLE paging ADD COLUMN oldest DOUBLE")
                 try db.execute(sql: """
@@ -107,6 +115,15 @@ public actor LiveFeed {
                     ALTER TABLE transfer ADD COLUMN jobName TEXT;
                     ALTER TABLE transfer ADD COLUMN progress DOUBLE;
                     ALTER TABLE transfer ADD COLUMN timeLeft TEXT;
+                    """)
+            }
+            if try !db.columns(in: "paging").contains(where: { $0.name == "historyPages" }) {
+                // Older builds kept the exact next offset, but not the sizes of individual pages.
+                try db.execute(sql: """
+                    ALTER TABLE paging ADD COLUMN historyPages INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE paging ADD COLUMN through DOUBLE;
+                    ALTER TABLE paging ADD COLUMN lastAttempt DOUBLE;
+                    UPDATE paging SET historyPages = (offset - 1) / 100 WHERE offset > 100;
                     """)
             }
             if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade)") == false {
@@ -215,7 +232,8 @@ public actor LiveFeed {
             }
             do {
                 let page = try await newznab.page(source, offset: offset, term: search?.term)
-                let refs = try remember(page, source: id, earlier: earlier, searching: search != nil, now: now)
+                try Task.checkCancellation()
+                let refs = try remember(page, source: id, offset: offset, searching: search != nil, now: now)
                 indexerSearch?.offerIDs.formUnion(refs)
                 indexerSearch?.offsets?[id] = page.next
             } catch {
@@ -227,7 +245,11 @@ public actor LiveFeed {
         let cutoff = now.addingTimeInterval(-90 * 86400).timeIntervalSince1970
         try await store.write {
             // Expired pages must be reachable again from the top of the catalog.
-            try $0.execute(sql: "UPDATE paging SET offset=0, oldest=NULL WHERE source IN (SELECT source FROM offer WHERE lastSeen < ?)", arguments: [cutoff])
+            try $0.execute(sql: """
+                UPDATE paging SET offset=0, oldest=NULL, historyPages=0, through=NULL
+                WHERE (lastAttempt IS NULL OR lastAttempt < ?)
+                AND source IN (SELECT source FROM offer WHERE lastSeen < ?)
+                """, arguments: [now.addingTimeInterval(-Double(IndexerHistory.dayLimit) * 86400).timeIntervalSince1970, cutoff])
             try $0.execute(sql: "DELETE FROM offer WHERE lastSeen < ?", arguments: [cutoff])
             try $0.execute(sql: "DELETE FROM metadata WHERE video NOT IN (SELECT video FROM offer WHERE video IS NOT NULL)")
         }
@@ -239,13 +261,53 @@ public actor LiveFeed {
                 issues.append("PRDB: " + error.localizedDescription)
             }
         } else { issues.append("PRDB: waiting to retry.") }
-        var page = try cached()
+        var page = try cached(now: now)
         page.indexerSearch = indexerSearch
         page.issues = issues
         return page
     }
 
-    private func remember(_ page: NewznabFeed.Page, source: String, earlier: Bool, searching: Bool, now: Date) throws -> [String] {
+    /// Reserve one older page across all indexers. Newly discovered offers join the normal PRDB queue.
+    public func loadEarlierInBackground(now: Date = .now) async throws -> FeedPage? {
+        guard !busy, let config = try connections(), try clock(for: "PRDB", now: now, includePoll: false) else { return nil }
+        busy = true
+        defer { busy = false }
+        let timestamp = now.timeIntervalSince1970
+        let candidate = try await store.write { db -> IndexerHistory? in
+            let history = try IndexerHistory.read(db, sources: config.indexers, now: now)
+            guard history.compactMap(\.lastAttempt).allSatisfy({ $0 <= timestamp - 60 }),
+                  let next = history.filter({ $0.status == .moreAvailable && ($0.retry ?? 0) <= timestamp })
+                    .min(by: { ($0.lastAttempt ?? 0) < ($1.lastAttempt ?? 0) }) else { return nil }
+            guard try !Self.hasDueMetadata(db, at: timestamp) else { return nil }
+            try db.execute(sql: "UPDATE paging SET lastAttempt=? WHERE source=?", arguments: [timestamp, next.id.uuidString])
+            return next
+        }
+        guard let candidate, let offset = candidate.offset,
+              let source = config.indexers.first(where: { $0.id == candidate.id }) else { return nil }
+        let id = source.id.uuidString
+        try Task.checkCancellation()
+        let result: NewznabFeed.Page
+        do {
+            result = try await newznab.page(source, offset: offset)
+        } catch {
+            try Task.checkCancellation()
+            try backoff(error, service: id, now: now)
+            throw FeedError("\(source.name): \(error.localizedDescription)")
+        }
+        try Task.checkCancellation()
+        _ = try remember(result, source: id, offset: offset, searching: false, now: now)
+        return try cached(now: now)
+    }
+
+    static func hasDueMetadata(_ db: Database, at timestamp: Double) throws -> Bool {
+        try Bool.fetchOne(db, sql: """
+            SELECT EXISTS(SELECT 1 FROM offer WHERE nextCheck <= ?)
+                OR EXISTS(SELECT 1 FROM offer o LEFT JOIN metadata m ON m.video=o.video
+                          WHERE o.video IS NOT NULL AND (m.fetched IS NULL OR m.fetched < ?))
+            """, arguments: [timestamp, timestamp - 86400]) == true
+    }
+
+    private func remember(_ page: NewznabFeed.Page, source: String, offset: Int, searching: Bool, now: Date) throws -> [String] {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         return try store.write { db in
@@ -261,15 +323,33 @@ public actor LiveFeed {
                 if searching, let ref { refs.append(ref) }
             }
             guard !searching else { return refs }
-            let oldest = page.uploads.compactMap(\.posted).min()?.timeIntervalSinceReferenceDate
+            let dates = page.uploads.compactMap(\.posted)
+            let oldest = dates.min()?.timeIntervalSinceReferenceDate
+            // A single old upload on a recent or mostly undated page cannot establish coverage.
+            let through = dates.count * 2 > page.uploads.count ? dates.max()?.timeIntervalSinceReferenceDate : nil
+            let earlier = offset > 0
+            if !earlier {
+                // After a whole lookback window offline, the previous cursor describes an older window.
+                let cutoff = now.addingTimeInterval(-Double(IndexerHistory.dayLimit) * 86400 + Self.recentPollInterval)
+                try db.execute(sql: """
+                    UPDATE paging SET offset=0, oldest=NULL, historyPages=0, through=NULL
+                    WHERE source=? AND source IN (SELECT id FROM sourceClock WHERE poll <= ?)
+                    """, arguments: [source, cutoff.timeIntervalSince1970])
+            }
             try db.execute(sql: """
-                INSERT INTO paging(source,offset,oldest) VALUES (?,?,?) ON CONFLICT(source) DO UPDATE SET
-                offset=CASE WHEN ? THEN excluded.offset ELSE paging.offset END,
-                oldest=COALESCE(MIN(paging.oldest,excluded.oldest),paging.oldest,excluded.oldest)
-                """, arguments: [source,page.next,oldest,earlier])
+                INSERT INTO paging(source,offset,oldest,historyPages,through) VALUES (?,?,?,?,?)
+                ON CONFLICT(source) DO UPDATE SET
+                offset=CASE WHEN ? OR paging.offset=0 OR (paging.historyPages=0 AND paging.offset IS NULL)
+                            THEN excluded.offset ELSE paging.offset END,
+                oldest=COALESCE(MIN(paging.oldest,excluded.oldest),paging.oldest,excluded.oldest),
+                historyPages=paging.historyPages + excluded.historyPages,
+                through=CASE WHEN ? THEN excluded.through
+                             WHEN paging.historyPages=0 THEN excluded.through ELSE paging.through END
+                WHERE excluded.historyPages=0 OR paging.offset=?
+                """, arguments: [source,page.next,oldest,earlier ? 1 : 0,through,earlier,earlier,offset])
             if !earlier {
                 try db.execute(sql: "INSERT OR REPLACE INTO sourceClock(id,poll) VALUES (?,?)",
-                               arguments: [source, now.addingTimeInterval(900).timeIntervalSince1970])
+                               arguments: [source, now.addingTimeInterval(Self.recentPollInterval).timeIntervalSince1970])
             }
             return refs
         }
@@ -361,12 +441,13 @@ public actor LiveFeed {
         return previews
     }
 
-    public func cached() throws -> FeedPage {
+    public func cached(now: Date = .now) throws -> FeedPage {
         guard let config = try connections() else { return FeedPage() }
         let sources = Dictionary(uniqueKeysWithValues: config.indexers.map { ($0.id.uuidString, $0.name) })
         return try store.read { db in
             var page = FeedPage()
-            page.hasEarlier = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM paging WHERE offset IS NOT NULL)") == true
+            page.history = try IndexerHistory.read(db, sources: config.indexers, now: now)
+            page.hasEarlier = page.history.contains { $0.offset != nil }
             page.oldestBrowsed = try Double.fetchOne(db, sql: "SELECT MIN(oldest) FROM paging").map(Date.init(timeIntervalSinceReferenceDate:))
             page.releaseCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM offer") ?? 0
             page.pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM offer WHERE video IS NULL AND nextCheck IS NOT NULL") ?? 0
@@ -407,7 +488,7 @@ public actor LiveFeed {
                                  offers: group.offers.sorted {
                                      (rank($0), $0.source, $0.name, $0.id) < (rank($1), $1.source, $1.name, $1.id)
                                  })
-            }.sorted { ($0.posted ?? .distantPast, $0.id.uuidString) > ($1.posted ?? .distantPast, $1.id.uuidString) }
+            }.sorted(by: FeedTitle.newestUploadFirst)
             return page
         }
     }

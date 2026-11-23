@@ -26,8 +26,8 @@ struct CatalogFilterDialog: View {
             }
             Divider()
             HStack(alignment: .top, spacing: 16) {
-                SubjectChoices(kind: .studios, entries: model.studios, selected: $draft.studioIDs)
-                SubjectChoices(kind: .actors, entries: model.actors, selected: $draft.actorIDs)
+                SubjectChoices(kind: .studios, entries: model.studios.filter { $0.count > 0 }, selected: $draft.studioIDs)
+                SubjectChoices(kind: .actors, entries: model.actors.filter { $0.count > 0 }, selected: $draft.actorIDs)
             }
             Divider()
             HStack {

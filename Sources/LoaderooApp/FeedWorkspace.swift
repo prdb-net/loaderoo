@@ -6,10 +6,14 @@ final class FeedWorkspace {
     var engine: LiveFeed?
     var config: FeedConnections?
     var page = FeedPage() {
-        didSet {
-            studios = DirectoryEntry.entries(in: page, kind: .studios)
-            actors = DirectoryEntry.entries(in: page, kind: .actors)
-        }
+        didSet { updateDirectories() }
+    }
+    private(set) var reference = PRDBCatalog() {
+        didSet { updateDirectories() }
+    }
+    private func updateDirectories() {
+        studios = DirectoryEntry.entries(in: page, kind: .studios, including: reference.studios)
+        actors = DirectoryEntry.entries(in: page, kind: .actors, including: reference.actors)
     }
     private(set) var studios: [DirectoryEntry] = []
     private(set) var actors: [DirectoryEntry] = []
@@ -28,6 +32,45 @@ final class FeedWorkspace {
     var scanning = false
     var sending = Set<UUID>()
     var downloadIssue: String?
+    @ObservationIgnored private var maintenance: Task<Void, Never>?
+    private var saving = false
+
+    private func interruptMaintenance() async {
+        guard let maintenance else { return }
+        maintenance.cancel()
+        await maintenance.value
+    }
+
+    func maintainCatalog() async {
+        guard let engine, config != nil, maintenance == nil, !loading, !saving, sending.isEmpty else { return }
+        let task = Task(priority: .utility) {
+            do {
+                let recent = try await engine.refresh()
+                try Task.checkCancellation()
+                page = recent
+                guard !scanning, !following else { return }
+                // Check PRDB before queuing more unresolved uploads from the indexers.
+                do {
+                    if try await engine.syncReferenceCatalog() { reference = try await engine.referenceCatalog() }
+                } catch {
+                    try Task.checkCancellation()
+                    reference = try await engine.referenceCatalog()
+                    page.issues.append(error.localizedDescription)
+                }
+                try Task.checkCancellation()
+                guard let updated = try await engine.loadEarlierInBackground() else { return }
+                try Task.checkCancellation()
+                var result = updated
+                result.issues = page.issues
+                page = result
+            } catch {
+                if !Task.isCancelled { page.issues.append(error.localizedDescription) }
+            }
+        }
+        maintenance = task
+        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        maintenance = nil
+    }
 
     func reload() async throws {
         guard let engine else { return }
@@ -70,6 +113,7 @@ final class FeedWorkspace {
     func download(_ item: FeedTitle, offerID: String?) async {
         guard let engine, sending.insert(item.id).inserted else { return }
         defer { sending.remove(item.id) }
+        await interruptMaintenance()
         do {
             try await engine.startDownload(item.id, offerID: offerID)
             try await reload()
@@ -85,9 +129,10 @@ final class FeedWorkspace {
             let service = try LiveFeed(root: support.appending(path: "net.prdb.loaderoo/Live"))
             engine = service
             config = try await service.connections()
+            reference = try await service.referenceCatalog()
             try await reload()
             ready = true
-            if config != nil { await refresh() }
+            await maintainCatalog()
         } catch { self.error = error.localizedDescription }
     }
 
@@ -97,6 +142,7 @@ final class FeedWorkspace {
         guard let engine, config != nil, !loading else { return nil }
         loading = true
         defer { loading = false }
+        await interruptMaintenance()
         do {
             let result = try await engine.refresh(manual: manual, earlier: earlier, search: search)
             page = result
@@ -112,6 +158,9 @@ final class FeedWorkspace {
 
     func save(_ draft: FeedConnections, verifySAB: Bool) async throws {
         guard let engine else { throw CocoaError(.fileReadUnknown) }
+        saving = true
+        defer { saving = false }
+        await interruptMaintenance()
         try await engine.configure(draft, verifySAB: verifySAB)
         config = try await engine.connections()
         indexerSearch = nil

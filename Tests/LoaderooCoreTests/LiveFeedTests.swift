@@ -160,6 +160,36 @@ struct LiveFeedTests {
         return config
     }
 
+    @Test func actorPhotoBatchPreservesGalleryAndMergeIDsAcrossRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let canonical = UUID(), alias = UUID(), missing = UUID()
+        let service = Services()
+        let feed = try LiveFeed(root: root, http: FeedHTTP { request in
+            guard request.url?.path == "/actors/batch" else { return try await service.respond(request) }
+            let input = try JSONDecoder().decode([String: [UUID]].self, from: try #require(request.httpBody))
+            #expect(Set(input["ids"] ?? []) == [canonical,alias,missing])
+            let response: [[String: Any]] = [["id": canonical.uuidString, "requestedIds": [alias.uuidString,canonical.uuidString],
+                "name": "Sam", "images": [
+                    ["url":"https://art.example.invalid/thumb","imageType":1], ["url":"file:///invalid","imageType":2],
+                    ["url":"https://art.example.invalid/face","imageType":3], ["url":"https://art.example.invalid/poster","imageType":2],
+                    ["url":"https://art.example.invalid/face","imageType":2], ["url":NSNull(),"imageType":1]]]]
+            return (try JSONSerialization.data(withJSONObject: response), HTTPURLResponse(url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil)!)
+        })
+        try await feed.configure(connections())
+        let result = try await feed.actorPhotos(for: [canonical,alias,missing])
+        #expect(result[canonical]?.map(\.lastPathComponent) == ["poster","face","thumb"])
+        #expect(result[alias] == result[canonical])
+        #expect(result[missing] == [])
+        let reopened = try LiveFeed(root: root, http: FeedHTTP { _ in
+            Issue.record("Opening a cached gallery should reuse its photos")
+            throw URLError(.notConnectedToInternet)
+        })
+        #expect(try await reopened.actorProfile(alias).photoURLs == result[canonical])
+        #expect(try await reopened.actorPhotos(for: [missing])[missing] == [])
+    }
+
     @Test func livePipelineGroupsListingsAndRechecksAfterRestart() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
