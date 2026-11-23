@@ -114,6 +114,10 @@ struct FeedHTTP: Sendable {
     }
 
     func data(_ request: URLRequest, retryReadIfReachable: Bool = false) async throws -> Data {
+        try await response(request, retryReadIfReachable: retryReadIfReachable).0
+    }
+
+    func response(_ request: URLRequest, retryReadIfReachable: Bool = false) async throws -> (Data, HTTPURLResponse) {
         let body: Data
         let response: HTTPURLResponse
         do { (body, response) = try await send(request) }
@@ -124,7 +128,7 @@ struct FeedHTTP: Sendable {
                 try Task.checkCancellation()
                 if status == .localNetworkDenied { throw LocalNetworkAccessRequired(endpoint: endpoint) }
                 if status == .reachable, retryReadIfReachable, request.httpMethod == "GET" {
-                    return try await data(request)
+                    return try await self.response(request)
                 }
             }
             throw FeedError("Connection failed. Check the address and network.")
@@ -137,7 +141,7 @@ struct FeedHTTP: Sendable {
                 ?? feedDate(value)
             throw HTTPFailure(status: response.statusCode, retryAt: deadline)
         }
-        return body
+        return (body, response)
     }
 }
 

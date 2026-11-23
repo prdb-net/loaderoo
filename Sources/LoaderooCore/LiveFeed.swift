@@ -32,6 +32,7 @@ public actor LiveFeed {
     let prdb: PRDBFeed
     let http: FeedHTTP
     var scanning = false
+    var receiptHistoryUpdates: [String: Int] = [:]
     var polling = false
     private var busy = false
 

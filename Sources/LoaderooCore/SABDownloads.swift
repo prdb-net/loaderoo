@@ -52,11 +52,14 @@ public struct Transfer: Decodable, FetchableRecord, Identifiable, Sendable {
 
 private struct SABSlot: Decodable {
     let nzo_id: String
-    let filename, name, status, storage: String?
+    let filename, name, nzb_name, status, storage: String?
 }
 
 private struct SABEnvelope: Decodable {
-    struct Page: Decodable { let slots: [SABSlot] }
+    struct Page: Decodable {
+        let slots: [SABSlot]
+        let noofslots, last_history_update: Int?
+    }
     let queue, history: Page?
 }
 
@@ -89,7 +92,7 @@ extension LiveFeed {
                 return (a.0.id.uuidString, a.1.entry) < (b.0.id.uuidString, b.1.entry)
             }
         }
-        var selected: (String,Upload,Data)?
+        var selected: (provider: String, upload: Upload, nzb: Data, jobName: String)?
         var lastError: Error = FeedError("The indexers have no usable NZB for this title.")
         for (provider, upload) in offers {
             try Task.checkCancellation()
@@ -98,9 +101,9 @@ extension LiveFeed {
             url.append(queryItems: [.init(name: "t", value: "get"), .init(name: "id", value: upload.downloadID ?? upload.entry),
                                     .init(name: "apikey", value: provider.apiKey)])
             do {
-                let data = try await http.data(URLRequest(url: url))
+                let (data, response) = try await http.response(URLRequest(url: url))
                 guard NZBCheck.valid(data) else { throw FeedError("The indexer returned an invalid NZB.") }
-                selected = (provider.name, upload, data)
+                selected = (provider.name, upload, data, Self.jobName(response, fallback: upload.title))
                 break
             } catch {
                 try Task.checkCancellation()
@@ -108,8 +111,8 @@ extension LiveFeed {
                 lastError = error
             }
         }
-        guard let (provider,upload,nzb) = selected else { throw lastError }
-        let token = "Loaderoo-" + UUID().uuidString
+        guard let (provider,upload,nzb,jobName) = selected else { throw lastError }
+        let token = UUID().uuidString + ".nzb"
         let endpoint = try sab.endpoint.absoluteString
         // Reserve before the only external write. The token also identifies a job whose HTTP reply was lost.
         let reserved = try await store.write { db in
@@ -123,13 +126,13 @@ extension LiveFeed {
             return true
         }
         guard reserved else { return }
-        var query: [URLQueryItem] = [.init(name: "nzbname", value: token)]
+        var query: [URLQueryItem] = [.init(name: "nzbname", value: jobName)]
         if !sab.category.isEmpty { query.append(.init(name: "cat", value: sab.category)) }
         var request = try sab.request("addfile", query)
         request.httpMethod = "POST"
         let boundary = UUID().uuidString
         request.setValue("multipart/form-data; boundary=" + boundary, forHTTPHeaderField: "Content-Type")
-        var body = Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"name\"; filename=\"\(token).nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n".utf8)
+        var body = Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"name\"; filename=\"\(token)\"\r\nContent-Type: application/x-nzb\r\n\r\n".utf8)
         body.append(nzb)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         request.httpBody = body
@@ -146,6 +149,16 @@ extension LiveFeed {
         } catch {
             try update(raw, state: "Checking receipt", note: "Looking for the submitted job in SABnzbd.")
         }
+    }
+
+    private static func jobName(_ response: HTTPURLResponse, fallback: String) -> String {
+        // suggestedFilename can also be synthesized from the API URL and MIME type.
+        let disposition = response.value(forHTTPHeaderField: "Content-Disposition") ?? ""
+        let hasFilename = disposition.range(of: #";\s*filename\*?\s*=\s*(?:"[^"]+"|[^\s";]+)"#,
+                                            options: [.regularExpression, .caseInsensitive]) != nil
+        let name = (hasFilename ? response.suggestedFilename : nil) ?? fallback
+        let stem = name.lowercased().hasSuffix(".nzb") ? String(name.dropLast(4)) : name
+        return component(stem)
     }
 
     private func update(_ id: String, state: String, job: String? = nil, note: String? = nil, storage: String? = nil) throws {
@@ -185,17 +198,7 @@ extension LiveFeed {
         try await resolveMissingStudios(config, sab: sab)
         for item in try transfers() where item.endpoint == endpoint && !item.retryable && item.state != "Completed" {
             if item.storage != nil { try finish(item, sab: sab); continue }
-            var found = false
-            for mode in ["queue","history"] {
-                let filter = item.job.map { URLQueryItem(name: "nzo_ids", value: $0) } ?? URLQueryItem(name: "search", value: item.token)
-                let data = try await http.data(sab.request(mode,[filter]))
-                let response = try JSONDecoder().decode(SABEnvelope.self, from: data)
-                guard let page = mode == "queue" ? response.queue : response.history else { throw FeedError("Could not read SABnzbd queue or history. Check its API key.") }
-                let matches = page.slots.filter { slot in
-                    if let job = item.job { return slot.nzo_id == job }
-                    return [slot.name,slot.filename].contains(item.token) || [slot.name,slot.filename].contains(item.token + ".nzb")
-                }
-                guard matches.count == 1, let hit = matches.first else { continue }
+            if let (mode, hit) = try await findJob(item, sab: sab) {
                 let state = hit.status ?? "Queued"
                 if mode == "history", state == "Completed" {
                     guard let path = hit.storage, !path.isEmpty else { throw FeedError("SABnzbd history has no completion path.") }
@@ -203,11 +206,61 @@ extension LiveFeed {
                 } else {
                     try update(item.id, state: state == "Completed" ? "Processing" : state, job: hit.nzo_id)
                 }
-                found = true
-                break
+            } else {
+                try update(item.id, state: "Checking receipt", note: "Waiting for the job in SABnzbd.")
             }
-            if !found { try update(item.id, state: "Checking receipt", note: "Waiting for the job in SABnzbd queue or history.") }
         }
+    }
+
+    private func findJob(_ item: Transfer, sab: SABConnection) async throws -> (String, SABSlot)? {
+        // New submissions use the upload filename as a receipt. Only history exposes it
+        // separately from the display name. Older submissions used the token as their job name.
+        if item.job == nil && item.token.hasSuffix(".nzb") {
+            return try await historyReceipt(item.token, sab: sab).map { ("history", $0) }
+        }
+
+        let filter = item.job.map { URLQueryItem(name: "nzo_ids", value: $0) } ?? URLQueryItem(name: "search", value: item.token)
+        for mode in ["queue", "history"] {
+            let page = try await jobPage(mode, sab: sab, query: [filter])
+            let matches = page.slots.filter { slot in
+                if let job = item.job { return slot.nzo_id == job }
+                return [slot.name,slot.filename].contains(item.token) || [slot.name,slot.filename].contains(item.token + ".nzb")
+            }
+            if matches.count == 1, let hit = matches.first { return (mode, hit) }
+        }
+        return nil
+    }
+
+    private func historyReceipt(_ token: String, sab: SABConnection) async throws -> SABSlot? {
+        let limit = 50
+        var start = 0
+        var historyUpdate: Int?
+        repeat {
+            let page = try await jobPage("history", sab: sab, query: [
+                .init(name: "start", value: String(start)), .init(name: "limit", value: String(limit))
+            ])
+            if let hit = page.slots.first(where: { $0.nzb_name == token }) {
+                receiptHistoryUpdates.removeValue(forKey: token)
+                return hit
+            }
+            if start == 0 {
+                historyUpdate = page.last_history_update
+                if let historyUpdate, receiptHistoryUpdates[token] == historyUpdate { return nil }
+            }
+            start += page.slots.count
+            if page.slots.isEmpty || start >= (page.noofslots ?? start) { break }
+        } while true
+        receiptHistoryUpdates[token] = historyUpdate
+        return nil
+    }
+
+    private func jobPage(_ mode: String, sab: SABConnection, query: [URLQueryItem]) async throws -> SABEnvelope.Page {
+        let data = try await http.data(sab.request(mode, query))
+        let response = try JSONDecoder().decode(SABEnvelope.self, from: data)
+        guard let page = mode == "queue" ? response.queue : response.history else {
+            throw FeedError("Could not read SABnzbd queue or history. Check its API key.")
+        }
+        return page
     }
 }
 

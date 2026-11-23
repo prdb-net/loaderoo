@@ -7,7 +7,10 @@ private actor MediaAPI {
     let artwork = URL(string: "https://images.example.invalid/still.jpg")!
     var searches: [Int] = []
     var submissions = 0
-    var token: String?
+    let disposition: String?
+    var jobName: String?
+    var uploadFilename: String?
+    init(disposition: String? = nil) { self.disposition = disposition }
     var completed = false
     var loseReply = false
     func finish() { completed = true }
@@ -18,6 +21,7 @@ private actor MediaAPI {
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func value(_ key: String) -> String? { query.first { $0.name == key }?.value }
         func json(_ value: Any) throws -> Data { try JSONSerialization.data(withJSONObject: value) }
+        var headers: [String: String] = [:]
         let data: Data
         if url.host == "api.prdb.net" {
             switch url.path {
@@ -51,16 +55,28 @@ private actor MediaAPI {
             switch value("mode") {
             case "addfile":
                 submissions += 1
-                token = value("nzbname")
+                jobName = value("nzbname")
+                let body = String(decoding: try #require(request.httpBody), as: UTF8.self)
+                uploadFilename = try #require(body.firstMatch(of: /filename="([^"]+)"/)?.1.description)
                 #expect(request.httpMethod == "POST")
-                #expect(String(decoding: request.httpBody!, as: UTF8.self).contains("<segment"))
+                #expect(body.contains("<segment"))
                 if loseReply { throw URLError(.networkConnectionLost) }
                 data = try json(["status":true,"nzo_ids":["SAB-job"]])
-            case "queue": data = try json(["queue":["slots":completed ? [] : [["filename":token ?? "", "nzo_id":"SAB-job","status":"Downloading"]]]])
-            case "history": data = try json(["history":["slots":[["name":token ?? "", "nzo_id":"SAB-job","status":"Completed","storage":"/downloads/complete/job"]]]])
+            case "queue":
+                let slots = completed || jobName == nil ? [] : [["filename":jobName ?? "", "nzo_id":"SAB-job", "status":"Downloading"]]
+                data = try json(["queue":["slots":slots]])
+            case "history":
+                let name = jobName ?? ""
+                var slots = [["name":name, "nzb_name":"other.nzb", "nzo_id":"other", "status":"Completed", "storage":"/downloads/complete/other"]]
+                if completed {
+                    slots.append(["name":name, "nzb_name":try #require(uploadFilename), "nzo_id":"SAB-job", "status":"Completed", "storage":"/downloads/complete/" + name])
+                }
+                data = try json(["history":["slots":slots]])
             default: throw FeedError("Unexpected SABnzbd operation")
             }
         } else if value("t") == "get" {
+            headers["Content-Type"] = "application/x-nzb"
+            headers["Content-Disposition"] = disposition
             #expect(value("id") == "download-a")
             data = Data("<nzb><file><segments><segment>sample@example.invalid</segment></segments></file></nzb>".utf8)
         } else {
@@ -73,7 +89,7 @@ private actor MediaAPI {
                 </channel></rss>
                 """.utf8)
         }
-        return (data,HTTPURLResponse(url: url,statusCode: 200,httpVersion: nil,headerFields: nil)!)
+        return (data,HTTPURLResponse(url: url,statusCode: 200,httpVersion: nil,headerFields: headers)!)
     }
 }
 
@@ -99,10 +115,10 @@ struct MediaWorkflowTests {
 
     @Test func confirmedDownloadRecoversReceiptAndFilesUnderSelectedTitle() async throws {
         defer { try? FileManager.default.removeItem(at: root) }
-        let api = MediaAPI()
+        let api = MediaAPI(disposition: "attachment; filename*=UTF-8''Caf%C3%A9%20Walk.1080p.nzb")
         let feed = try await setup(api)
         let fm = FileManager.default
-        let output = root.appending(path: "mount/job/")
+        let output = root.appending(path: "mount/Café Walk.1080p/")
         let studio = root.appending(path: "videos/Studio North/")
         try fm.createDirectory(at: output,withIntermediateDirectories: true)
         try fm.createDirectory(at: studio,withIntermediateDirectories: true)
@@ -114,9 +130,10 @@ struct MediaWorkflowTests {
         try await feed.startDownload(api.id)
         try await feed.startDownload(api.id)
         #expect(await api.submissions == 1)
+        #expect(await api.jobName == "Café Walk.1080p")
         let reopened = try LiveFeed(root: root,http: FeedHTTP { try await api.perform($0) })
         try await reopened.followDownloads()
-        #expect(try await reopened.transfers().first?.job == "SAB-job")
+        #expect(try await reopened.transfers().first?.job == nil)
         await api.finish()
         try await reopened.followDownloads()
         #expect(try await reopened.cached().titles.isEmpty)
@@ -124,6 +141,7 @@ struct MediaWorkflowTests {
         let result = try #require(try await reopened.transfers().first)
         #expect(result.note == nil)
         #expect(result.state == "Completed")
+        #expect(result.job == "SAB-job")
         let target = studio.appending(path: "Harbor Walk (2).mkv")
         #expect(result.localPath == target.path)
         #expect(try Data(contentsOf: target) == Data("video".utf8))
@@ -134,6 +152,17 @@ struct MediaWorkflowTests {
         try await reopened.scanLibrary()
         let managed = try await reopened.library().first { $0.path == target.path }
         #expect(managed?.video == api.id.uuidString)
+    }
+
+    @Test(arguments: [nil, "attachment"] as [String?])
+    func downloadFolderFallsBackToIndexerListingTitle(disposition: String?) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI(disposition: disposition)
+        let feed = try await setup(api)
+        try await feed.startDownload(api.id)
+        #expect(await api.jobName == "Test.Release")
+        try await feed.followDownloads()
+        #expect(try await feed.transfers().first?.state == "Downloading")
     }
 
     @Test func earlierUploadsResumeAtProviderOffsetAfterRestart() async throws {
