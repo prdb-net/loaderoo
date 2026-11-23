@@ -1,0 +1,293 @@
+import Foundation
+import GRDB
+import CryptoKit
+
+public struct FeedOffer: Identifiable, Sendable {
+    public let id, source, name: String
+    public let size: Int64?
+}
+
+public struct FeedTitle: Identifiable, Sendable {
+    public let id: UUID
+    public let title: String
+    public let studio: String?
+    public let preview: URL?
+    public let posted: Date?
+    public let sources: [String]
+    public let qualities: [String]
+    public let offers: [FeedOffer]
+}
+
+public struct FeedPage: Sendable {
+    public var titles: [FeedTitle] = []
+    public var issues: [String] = []
+    public var pending = 0
+    public var hasEarlier = false
+    public init() {}
+}
+
+public actor LiveFeed {
+    let store: DatabaseQueue
+    private let newznab: NewznabFeed
+    let prdb: PRDBFeed
+    let http: FeedHTTP
+    var scanning = false
+    var polling = false
+    private var busy = false
+
+    public init(root: URL) throws {
+        try self.init(root: root, http: FeedHTTP())
+    }
+
+    init(root: URL, http: FeedHTTP) throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        store = try DatabaseQueue(path: root.appending(path: "Feed.sqlite").path)
+        self.http = http
+        newznab = NewznabFeed(http: http)
+        prdb = PRDBFeed(http: http)
+        try store.write { db in
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS connection (id INTEGER PRIMARY KEY CHECK(id = 1), config BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS sourceClock (id TEXT PRIMARY KEY, poll DOUBLE, retry DOUBLE);
+                CREATE TABLE IF NOT EXISTS offer (
+                    ref TEXT PRIMARY KEY, source TEXT NOT NULL, entry TEXT NOT NULL, payload BLOB NOT NULL,
+                    lastSeen DOUBLE NOT NULL, nextCheck DOUBLE, video TEXT, UNIQUE(source, entry));
+                CREATE TABLE IF NOT EXISTS metadata (video TEXT PRIMARY KEY, payload BLOB NOT NULL, fetched DOUBLE NOT NULL);
+                CREATE TABLE IF NOT EXISTS folder(path TEXT PRIMARY KEY, offline BOOLEAN NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS libraryFile(
+                    path TEXT PRIMARY KEY, root TEXT NOT NULL, size INTEGER NOT NULL, modified DOUBLE NOT NULL,
+                    hash TEXT, video TEXT, title TEXT, studio TEXT, image TEXT, seen TEXT NOT NULL, checked DOUBLE);
+                CREATE INDEX IF NOT EXISTS libraryVideo ON libraryFile(video);
+                CREATE TABLE IF NOT EXISTS transfer(
+                    video TEXT PRIMARY KEY, title TEXT NOT NULL, studio TEXT, image TEXT, provider TEXT NOT NULL,
+                    endpoint TEXT NOT NULL, token TEXT UNIQUE NOT NULL, job TEXT, state TEXT NOT NULL,
+                    note TEXT, storage TEXT, localPath TEXT, created DOUBLE NOT NULL);
+                CREATE TABLE IF NOT EXISTS paging(source TEXT PRIMARY KEY, offset INTEGER);
+                CREATE TABLE IF NOT EXISTS transferSource(video TEXT PRIMARY KEY,entry TEXT NOT NULL,releaseName TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS completedFile(video TEXT PRIMARY KEY,size INTEGER NOT NULL,modified DOUBLE NOT NULL);
+                CREATE TABLE IF NOT EXISTS studioRetry(video TEXT PRIMARY KEY,checked DOUBLE NOT NULL);
+                CREATE TABLE IF NOT EXISTS staging(video TEXT PRIMARY KEY,path TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS filing(video TEXT PRIMARY KEY,plan BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS previewUpgrade(version INTEGER PRIMARY KEY);
+                """)
+            if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade)") == false {
+                try db.execute(sql: "UPDATE metadata SET fetched=0 WHERE json_extract(CAST(payload AS TEXT),'$.image') IS NULL")
+                try db.execute(sql: "INSERT INTO previewUpgrade VALUES(1)")
+            }
+        }
+    }
+
+    public func connections() throws -> FeedConnections? {
+        try store.read { db in
+            try Data.fetchOne(db, sql: "SELECT config FROM connection").map { try JSONDecoder().decode(FeedConnections.self, from: $0) }
+        }
+    }
+
+    public func configure(_ draft: FeedConnections, verifySAB: Bool = false) async throws {
+        guard !busy else { throw FeedError("A refresh is already running.") }
+        busy = true
+        defer { busy = false }
+        let config = try draft.validated()
+        let old = try connections()
+        if let sab = config.sab, verifySAB || old?.sab?.address != sab.address || old?.sab?.apiKey != sab.apiKey {
+            try await checkSAB(sab)
+        }
+        if old?.prdbKey != config.prdbKey {
+            let digest = SHA256.hash(data: Data(config.prdbKey.utf8)).map { String(format: "%02x", $0) }.joined()
+            let validation = "setup-" + digest
+            guard try clock(for: validation, now: .now, includePoll: false) else {
+                throw FeedError("PRDB has limited requests for this key. Try again later.")
+            }
+            do { try await prdb.validate(config.prdbKey) }
+            catch {
+                if let failure = error as? HTTPFailure, failure.status == 429 || failure.retryAt != nil {
+                    try backoff(error, service: validation, now: .now)
+                }
+                throw FeedError("PRDB: " + error.localizedDescription)
+            }
+        }
+        try await store.write { db in
+            for previous in old?.indexers ?? [] {
+                if !config.indexers.contains(previous) {
+                    try db.execute(sql: "DELETE FROM offer WHERE source = ?", arguments: [previous.id.uuidString])
+                    try db.execute(sql: "DELETE FROM paging WHERE source=?", arguments: [previous.id.uuidString])
+                    try db.execute(sql: "DELETE FROM sourceClock WHERE id = ?", arguments: [previous.id.uuidString])
+                }
+            }
+            if old?.prdbKey != config.prdbKey {
+                try db.execute(sql: "DELETE FROM sourceClock WHERE id = 'PRDB'")
+            }
+            try db.execute(sql: "INSERT OR REPLACE INTO connection VALUES (1, ?)", arguments: [try JSONEncoder().encode(config)])
+        }
+    }
+
+    func clock(for id: String, now: Date, includePoll: Bool) throws -> Bool {
+        try store.read { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT poll, retry FROM sourceClock WHERE id = ?", arguments: [id]) else { return true }
+            let poll: Double? = row["poll"], retry: Double? = row["retry"]
+            return max(includePoll ? poll ?? 0 : 0, retry ?? 0) <= now.timeIntervalSince1970
+        }
+    }
+
+    func backoff(_ error: Error, service: String, now: Date) throws {
+        let response = error as? HTTPFailure
+        let delay: TimeInterval = response?.status == 429 ? 900 : 60
+        let expires = max(now.addingTimeInterval(delay), response?.retryAt ?? now)
+        try store.write {
+            try $0.execute(sql: """
+                INSERT INTO sourceClock(id,retry) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET retry=excluded.retry
+                """, arguments: [service, expires.timeIntervalSince1970])
+        }
+    }
+
+    public func refresh(manual: Bool = false, earlier: Bool = false, now: Date = .now) async throws -> FeedPage {
+        guard !busy else { return try cached() }
+        guard let config = try connections() else { throw FeedError("Set up your connections to load recent uploads.") }
+        busy = true
+        defer { busy = false }
+        var issues: [String] = []
+        for source in config.indexers {
+            try Task.checkCancellation()
+            let id = source.id.uuidString
+            let offset: Int
+            if earlier {
+                guard let next = try await store.read({ try Int.fetchOne($0, sql: "SELECT offset FROM paging WHERE source=? AND offset IS NOT NULL", arguments: [id]) }) else { continue }
+                offset = next
+            } else { offset = 0 }
+            guard try clock(for: id, now: now, includePoll: !manual && !earlier) else {
+                if try !clock(for: id, now: now, includePoll: false) { issues.append("\(source.name): waiting to retry.") }
+                continue
+            }
+            do {
+                let page = try await newznab.page(source, offset: offset)
+                try remember(page, source: id, earlier: earlier, now: now)
+            } catch {
+                try Task.checkCancellation()
+                try backoff(error, service: id, now: now)
+                issues.append("\(source.name): \(error.localizedDescription)")
+            }
+        }
+        try await store.write {
+            try $0.execute(sql: "DELETE FROM offer WHERE lastSeen < ?", arguments: [now.addingTimeInterval(-7 * 86400).timeIntervalSince1970])
+            try $0.execute(sql: "DELETE FROM metadata WHERE video NOT IN (SELECT video FROM offer WHERE video IS NOT NULL)")
+        }
+        if try clock(for: "PRDB", now: now, includePoll: false) {
+            do { try await enrich(config, now: now) }
+            catch {
+                try Task.checkCancellation()
+                try backoff(error, service: "PRDB", now: now)
+                issues.append("PRDB: " + error.localizedDescription)
+            }
+        } else { issues.append("PRDB: waiting to retry.") }
+        var page = try cached()
+        page.issues = issues
+        return page
+    }
+
+    private func remember(_ page: NewznabFeed.Page, source: String, earlier: Bool, now: Date) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        try store.write { db in
+            for upload in page.uploads {
+                try db.execute(sql: """
+                    INSERT INTO offer(ref,source,entry,payload,lastSeen,nextCheck) VALUES (?,?,?,?,?,0)
+                    ON CONFLICT(source,entry) DO UPDATE SET
+                    nextCheck=CASE WHEN payload != excluded.payload THEN 0 ELSE nextCheck END,
+                    video=CASE WHEN payload != excluded.payload THEN NULL ELSE video END,
+                    payload=excluded.payload,lastSeen=excluded.lastSeen
+                    """, arguments: [UUID().uuidString, source, upload.entry, try encoder.encode(upload), now.timeIntervalSince1970])
+            }
+            if earlier {
+                try db.execute(sql: "INSERT OR REPLACE INTO paging VALUES (?,?)", arguments: [source,page.next])
+            } else {
+                try db.execute(sql: "INSERT OR IGNORE INTO paging VALUES (?,?)", arguments: [source,page.next])
+                try db.execute(sql: "INSERT OR REPLACE INTO sourceClock(id,poll) VALUES (?,?)",
+                               arguments: [source, now.addingTimeInterval(900).timeIntervalSince1970])
+            }
+        }
+    }
+
+    private func enrich(_ config: FeedConnections, now: Date) async throws {
+        let sources = Dictionary(uniqueKeysWithValues: config.indexers.map { ($0.id.uuidString, $0) })
+        let due = try await store.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM offer WHERE nextCheck <= ? ORDER BY nextCheck,ref LIMIT 400",
+                             arguments: [now.timeIntervalSince1970]).compactMap { row -> PendingUpload? in
+                guard let source = sources[row["source"]] else { return nil }
+                return PendingUpload(ref: row["ref"], connection: source, upload: try JSONDecoder().decode(Upload.self, from: row["payload"]))
+            }
+        }
+        for start in stride(from: 0, to: due.count, by: 100) {
+            try Task.checkCancellation()
+            let results = try await prdb.resolve(Array(due[start..<min(start+100, due.count)]), key: config.prdbKey)
+            try await store.write { db in
+                for row in results {
+                    let permanent = ["unsupported", "invalid"].contains(row.status)
+                    let later = row.recheckAfterUtc.flatMap(feedDate) ?? now.addingTimeInterval(86400)
+                    let next = permanent ? nil : max(now.addingTimeInterval(60), later).timeIntervalSince1970
+                    try db.execute(sql: "UPDATE offer SET video=?,nextCheck=? WHERE ref=?",
+                                   arguments: [row.confirmedID?.uuidString, next, row.ref])
+                }
+            }
+        }
+        let missing = try await store.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT DISTINCT o.video FROM offer o LEFT JOIN metadata m ON m.video=o.video
+                WHERE o.video IS NOT NULL AND (m.fetched IS NULL OR m.fetched < ?) ORDER BY m.fetched LIMIT 100
+                """, arguments: [now.addingTimeInterval(-86400).timeIntervalSince1970])
+        }
+        for raw in missing {
+            try Task.checkCancellation()
+            guard let id = UUID(uuidString: raw) else { continue }
+            do {
+                let detail = try await prdb.video(id, key: config.prdbKey)
+                try await store.write {
+                    try $0.execute(sql: "INSERT OR REPLACE INTO metadata VALUES (?,?,?)",
+                                   arguments: [raw, try JSONEncoder().encode(detail), now.timeIntervalSince1970])
+                }
+            } catch let error as HTTPFailure where error.status == 404 || error.status == 410 {
+                try await store.write {
+                    try $0.execute(sql: "UPDATE offer SET video=NULL,nextCheck=? WHERE video=?",
+                                   arguments: [now.addingTimeInterval(86400).timeIntervalSince1970,raw])
+                }
+            }
+        }
+    }
+
+    public func cached() throws -> FeedPage {
+        guard let config = try connections() else { return FeedPage() }
+        let sources = Dictionary(uniqueKeysWithValues: config.indexers.map { ($0.id.uuidString, $0.name) })
+        return try store.read { db in
+            var page = FeedPage()
+            page.hasEarlier = try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM paging WHERE offset IS NOT NULL)") == true
+            page.pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM offer WHERE video IS NULL AND nextCheck IS NOT NULL") ?? 0
+            let rows = try Row.fetchAll(db, sql: "SELECT o.ref,o.source,o.payload,m.payload AS detail FROM offer o JOIN metadata m ON m.video=o.video WHERE NOT EXISTS (SELECT 1 FROM libraryFile f WHERE f.video=o.video) AND NOT EXISTS (SELECT 1 FROM transfer t WHERE t.video=o.video AND t.storage IS NOT NULL)")
+            struct Group {
+                let metadata: FeedMetadata
+                var posted: Date?
+                var sources = Set<String>()
+                var qualities = Set<String>()
+                var offers: [FeedOffer] = []
+            }
+            var groups: [UUID: Group] = [:]
+            for row in rows {
+                let detail = try JSONDecoder().decode(FeedMetadata.self, from: row["detail"])
+                let upload = try JSONDecoder().decode(Upload.self, from: row["payload"])
+                guard let name = sources[row["source"]] else { continue }
+                var group = groups[detail.id] ?? Group(metadata: detail, posted: upload.posted)
+                if let date = upload.posted { group.posted = max(date, group.posted ?? date) }
+                group.sources.insert(name)
+                group.offers.append(FeedOffer(id: row["ref"], source: name, name: upload.title,size: upload.size))
+                if let quality = upload.quality { group.qualities.insert(quality) }
+                groups[detail.id] = group
+            }
+            page.titles = groups.values.map { group in
+                let detail = group.metadata
+                return FeedTitle(id: detail.id, title: detail.title, studio: detail.studio, preview: detail.image,
+                                 posted: group.posted, sources: group.sources.sorted(), qualities: group.qualities.sorted(),
+                                 offers: group.offers.sorted { ($0.source,$0.name,$0.id) < ($1.source,$1.name,$1.id) })
+            }.sorted { ($0.posted ?? .distantPast, $0.id.uuidString) > ($1.posted ?? .distantPast, $1.id.uuidString) }
+            return page
+        }
+    }
+}

@@ -1,2 +1,52 @@
-# loaderoo
-A native macOS desktop app for managing downloads for your adult media video collection. Supporting usenet and prdb.
+# Loaderoo
+
+Loaderoo is a native macOS app for discovering Usenet releases for an adult video library. Its live feed reads Newznab indexers and resolves their uploads through the PRDB public API. Loaderoo identifies existing videos, sends selected NZBs to your SABnzbd instance and files completed downloads by studio. See the [product vision](VISION.md).
+
+## Build and run
+
+On an Apple Silicon Mac with macOS 14 or later and a Swift 6.1 or newer toolchain, run:
+
+```sh
+scripts/build-app
+open dist/Loaderoo.app
+```
+
+Use `swift run Loaderoo` for development and `swift test` for the offline tests. Swift Package Manager fetches GRDB on the first build.
+
+Test macOS permission prompts with the app bundle. Local builds use ad hoc signing. For distribution outside the Mac App Store, set `CODE_SIGN_IDENTITY` to your Developer ID Application identity when running `scripts/build-app`. A consistent Apple-issued signing identity lets macOS recognize Loaderoo across updates. [Apple’s local network privacy technote](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+
+## Connect the live feed
+
+Choose **Set Up Connections**. Enter your personal PRDB API key and the API address and key for each Newznab indexer. The address field accepts an endpoint such as `https://indexer.example/api` or a bare host URL. A bare host uses `/api`. The default category is 6000 (adult). Use the IDs supported by your indexer, or clear the field to search all categories. Choose **Save Connections**. You can edit the entries later using **Connections** in the sidebar.
+
+While the live feed is open, Loaderoo reads the latest search page (up to 100 uploads per indexer) every 15 minutes. **Refresh** checks for new uploads immediately. **Load Earlier Uploads** reads the next available search page from each indexer. Loaderoo respects service retry deadlines. One unavailable indexer leaves the others usable.
+
+Only confirmed single-video matches appear. Offers for the same PRDB video share an entry with its preview artwork when available, its studio, source names and known qualities. The newest Usenet posting time determines the order. Titles with no reported Usenet posting time appear last. The RSS publication date describes indexing and is kept separate. [Newznab API](https://newznab.readthedocs.io/en/latest/misc/api.html#search) Loaderoo keeps recently seen listings for seven days after their last appearance, including unresolved entries, and checks for due PRDB retries once a minute while the feed is open. Cached matches survive restarts.
+
+Connection settings (including API keys) and feed data are stored locally in SQLite under `~/Library/Application Support/net.prdb.loaderoo/Live/`, in a directory restricted to your macOS account. The database is unencrypted. PRDB receives release names, posting times and available source identifiers, sizes and category hints for matching.
+
+## Match existing videos
+
+Open **Library → Manage Folders** and choose the folders you want to scan. Loaderoo reads video files in place and sends the basename, byte count and OSHash to PRDB. A unique OSHash match hides every upload for that video ID. Unmatched files remain in the library. **Scan Library** picks up filesystem changes and retries unresolved hashes after 24 hours. Offline folders retain their matches. Removing a folder removes its scan records and preserves the files on disk.
+
+## Download and file a release
+
+Open **Connections → SABnzbd**. Enter the API address of your running instance and its full API key. Saving the connection checks read access to the queue. You can assign a SABnzbd category.
+
+On macOS 15 or later, the first connection to a SABnzbd server or indexer on your local network can trigger a macOS permission prompt. Choose **Allow**. If you previously denied access, open **System Settings → Privacy & Security → Local Network** and turn on **Loaderoo**. Leave the SABnzbd form open and it will retry the queue check when access becomes available. You can also choose **Try Again**.
+
+For example, if SABnzbd reports completed jobs under `/downloads/complete` and Finder sees that folder at `/Volumes/Media/Completed`, enter the former as **Container folder** and select the latter as **Mounted on Mac**. Optionally choose a **Studio library** destination. Loaderoo otherwise leaves completed files in place.
+
+Click a title for its preview, studio, qualities and indexers. **Download** selects an available NZB and submits it once. **Downloads** shows the source, job status and completion path. Loaderoo remembers the submission across restarts. If the submission response is lost, it looks up the unique job name in SABnzbd’s queue and history. It can only reconcile a job that SABnzbd still retains.
+
+After post-processing, Loaderoo files a single completed video under `Studio/Video title.ext`, or keeps the extracted filename if you selected that option. It preserves existing destination files by choosing an available name. The PRDB title follows the job throughout filing. Unknown studios can wait in place or in **Unsorted**. When a studio becomes available, Loaderoo can finish the move. A job folder containing several videos stays in place for review. Filesystem access and job tracking resume while the app is open. [SABnzbd API reference](https://sabnzbd.org/wiki/configuration/4.5/api)
+
+## Try the local download demo
+
+Open **Workspace → Open Local Demo**, or run `swift run Loaderoo --demo`. The demo uses two simulated indexers, simulated PRDB and simulated SABnzbd. It needs no accounts or live connections.
+
+1. Open **Recent uploads**. Two indexers offer *Night Shift* from *Studio North* with one **Download** action.
+2. Click **Download** and open **Downloads** to see the selected indexer. To try recovery, quit while the job is pending, relaunch and reopen the demo. Its job becomes ready twelve seconds after submission.
+3. Open **Library** and choose **Show in Finder**. Loaderoo maps the simulated container’s completed path to a local folder and moves the sample MP4 into `Library/Studio North/Night Shift.mp4`. The title disappears from the demo feed.
+
+The demo keeps its own queue, catalog and media under `~/Library/Application Support/net.prdb.loaderoo/Demo/`. To start in a fresh demo directory, run `LOADEROO_DEMO_ROOT="$(mktemp -d)" swift run Loaderoo`.
