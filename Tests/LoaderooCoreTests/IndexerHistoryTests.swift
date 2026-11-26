@@ -62,6 +62,13 @@ struct IndexerHistoryTests {
         try LiveFeed(root: root, http: FeedHTTP { try await service.respond($0) })
     }
 
+    /// A refresh reads its indexers side by side. Requests within each of these ranges arrive in either order.
+    private func requests(settling ranges: [Range<Int>]) async -> [String] {
+        var requests = await service.requests
+        for range in ranges where range.upperBound <= requests.count { requests[range].sort() }
+        return requests
+    }
+
     private func configure(_ names: [String]) async throws -> LiveFeed {
         let feed = try open()
         var config = FeedConnections()
@@ -99,8 +106,9 @@ struct IndexerHistoryTests {
         #expect(older.history.first?.status == .lookbackReached)
         _ = try await reopened.refresh(now: now.addingTimeInterval(900))
         #expect(try await reopened.loadEarlierInBackground(now: now.addingTimeInterval(900))?.history.map(\.pages) == [2, 2])
-        #expect(await service.requests == ["dated/0", "undated/0", "dated/2", "undated/2", "dated/4",
-                                           "dated/0", "undated/0", "undated/4"])
+        // A refresh reads both indexers side by side, so each such pair arrives in either order.
+        #expect(await requests(settling: [0..<2, 5..<7]) == ["dated/0", "undated/0", "dated/2", "undated/2", "dated/4",
+                                                             "dated/0", "undated/0", "undated/4"])
         let manual = try await reopened.refresh(earlier: true, now: now.addingTimeInterval(902))
         #expect(manual.history.first?.status == .endOfResults)
         _ = try await reopened.refresh(manual: true, now: now.addingTimeInterval(903))
@@ -137,7 +145,7 @@ struct IndexerHistoryTests {
         _ = try await feed.refresh(now: minute)
         try await feed.backoff(HTTPFailure(status: 429, retryAt: nil), service: "PRDB", now: minute)
         #expect(try await open().loadEarlierInBackground(now: now.addingTimeInterval(120)) == nil)
-        #expect(await service.requests == ["dated/0", "undated/0", "dated/2", "undated/2"])
+        #expect(await requests(settling: [0..<2]) == ["dated/0", "undated/0", "dated/2", "undated/2"])
     }
 
     @Test func freshHeadStartsANewWindowAfterAMonthOffline() async throws {
@@ -163,6 +171,7 @@ struct IndexerHistoryTests {
                 INSERT INTO oldPaging SELECT source,400,0 FROM paging;
                 DROP TABLE paging;
                 ALTER TABLE oldPaging RENAME TO paging;
+                DROP TABLE grdb_migrations;
                 """)
         }
         let reopened = try open()

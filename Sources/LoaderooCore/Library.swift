@@ -78,6 +78,7 @@ enum LibraryScanner {
         }
         var unchanged: [String] = []
         var changed: [Entry] = []
+        var found = 0
         func flush() throws {
             try db.write { database in
                 for path in unchanged {
@@ -104,6 +105,7 @@ enum LibraryScanner {
             guard properties.isRegularFile == true, properties.isSymbolicLink != true,
                   let bytes = properties.fileSize, let modified = properties.contentModificationDate?.timeIntervalSince1970 else { continue }
             let path = url.resolvingSymlinksInPath().path
+            found += 1
             if let cached = known[path], cached == (bytes,modified) {
                 unchanged.append(path)
             } else {
@@ -117,6 +119,9 @@ enum LibraryScanner {
             if changed.count + unchanged.count >= 200 { try flush() }
         }
         try flush()
+        // A share that dropped away can leave its mount point behind as an empty, readable folder.
+        // Treat a library that lost every video at once like an offline one and keep its matches.
+        if found == 0, !known.isEmpty { incomplete = true }
         try db.write {
             try $0.execute(sql: "UPDATE folder SET offline=? WHERE path=?", arguments: [incomplete,root])
             if !incomplete { try $0.execute(sql: "DELETE FROM libraryFile WHERE root=? AND seen!=?", arguments: [root,generation]) }
@@ -180,7 +185,9 @@ extension LiveFeed {
         defer { scanning = false }
         for folder in try folders() {
             let db = store
-            try await Task.detached(priority: .utility) { try LibraryScanner.discover(root: folder.path, db: db) }.value
+            let walk = Task.detached(priority: .utility) { try LibraryScanner.discover(root: folder.path, db: db) }
+            // A detached task does not hear about the caller being cancelled by itself.
+            try await withTaskCancellationHandler { try await walk.value } onCancel: { walk.cancel() }
         }
         struct Request: Encodable { let files: [HashInput]; let includeVideoDetails = true }
         struct Answer: Decodable { let results: [FileAnswer] }
@@ -204,6 +211,7 @@ extension LiveFeed {
                 answer = try await prdb.fetch("videos/identify", key: config.prdbKey,
                                               body: JSONEncoder().encode(Request(files: paths.map(\.1))))
             } catch {
+                try Task.checkCancellation()
                 try backoff(error, service: "PRDB", now: .now)
                 throw error
             }

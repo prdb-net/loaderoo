@@ -43,14 +43,35 @@ public struct SABConnection: Codable, Equatable, Sendable {
     }
 }
 
+/// One of Loaderoo's own stages, or SABnzbd's status text while a job is in its queue.
+public struct TransferState: RawRepresentable, Hashable, Sendable, Decodable, DatabaseValueConvertible {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let submitting = Self(rawValue: "Submitting"), checkingReceipt = Self(rawValue: "Checking receipt")
+    public static let queued = Self(rawValue: "Queued"), processing = Self(rawValue: "Processing")
+    public static let downloaded = Self(rawValue: "Downloaded"), awaitingFiling = Self(rawValue: "Awaiting filing")
+    public static let readyToFile = Self(rawValue: "Ready to file"), completed = Self(rawValue: "Completed")
+    public static let rejected = Self(rawValue: "Rejected"), failed = Self(rawValue: "Failed")
+}
+
 public struct Transfer: Decodable, FetchableRecord, Identifiable, Sendable {
-    public let video, title, provider, state: String
+    public let video, title, provider: String
+    public let state: TransferState
     let endpoint, token: String
     public let studio, image, job, note, storage, localPath, releaseName: String?
     public let jobName, timeLeft: String?
     public let progress: Double?
     public var id: String { video }
-    public var retryable: Bool { state == "Rejected" || state == "Failed" }
+    public var retryable: Bool { state == .rejected || state == .failed }
+    public var completed: Bool { state == .completed }
+    /// Still on its way to SABnzbd, through it, or into the library.
+    public var inProgress: Bool { !retryable && !completed }
+    public var needsAttention: Bool { retryable || state == .awaitingFiling || state == .checkingReceipt }
+    /// SABnzbd never confirmed the submission. Only its history can still show whether the NZB arrived.
+    public var awaitsReceipt: Bool { job == nil && storage == nil && (state == .submitting || state == .checkingReceipt) }
+    /// Filed where it is because PRDB had no studio for it yet.
+    public var awaitsStudio: Bool { completed && studio == nil }
 }
 
 private struct SABPercentage: Decodable {
@@ -129,7 +150,7 @@ extension LiveFeed {
             url.append(queryItems: [.init(name: "t", value: "get"), .init(name: "id", value: upload.downloadID ?? upload.entry),
                                     .init(name: "apikey", value: provider.apiKey)])
             do {
-                let (data, response) = try await http.response(URLRequest(url: url))
+                let (data, response) = try await http.response(URLRequest(url: url), nzb: true)
                 guard NZBCheck.valid(data) else { throw FeedError("The indexer returned an invalid NZB.") }
                 selected = (provider.name, upload, data, Self.jobName(response, fallback: upload.title))
                 break
@@ -144,11 +165,13 @@ extension LiveFeed {
         let endpoint = try sab.endpoint.absoluteString
         // Reserve before the only external write. The token also identifies a job whose HTTP reply was lost.
         let reserved = try await store.write { db in
-            try db.execute(sql: "DELETE FROM transfer WHERE video=? AND state IN ('Failed','Rejected')", arguments: [raw])
+            try db.execute(sql: "DELETE FROM transfer WHERE video=? AND state IN (?,?)",
+                           arguments: [raw, TransferState.failed, TransferState.rejected])
             try db.execute(sql: """
                 INSERT OR IGNORE INTO transfer(video,title,studio,image,provider,endpoint,token,state,created,jobName)
-                SELECT ?,?,?,?,?,?,?,'Submitting',?,? WHERE NOT EXISTS(SELECT 1 FROM libraryFile WHERE video=?)
-                """, arguments: [raw,title.title,title.studio,title.preview?.absoluteString,provider,endpoint,token,Date.now.timeIntervalSince1970,jobName,raw])
+                SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM libraryFile WHERE video=?)
+                """, arguments: [raw,title.title,title.studio,title.preview?.absoluteString,provider,endpoint,token,
+                                 TransferState.submitting,Date.now.timeIntervalSince1970,jobName,raw])
             guard db.changesCount == 1 else { return false }
             try db.execute(sql: "INSERT OR REPLACE INTO transferSource VALUES (?,?,?)", arguments: [raw,upload.entry,upload.title])
             return true
@@ -168,15 +191,34 @@ extension LiveFeed {
         do {
             let reply = try JSONDecoder().decode(Reply.self, from: await http.data(request))
             if reply.status == false || reply.error != nil {
-                try update(raw, state: "Rejected", note: "SABnzbd rejected the NZB. Check its API key and category.")
+                try update(raw, state: .rejected, note: "SABnzbd rejected the NZB. Check its API key and category.")
             } else if let ids = reply.nzo_ids, ids.count == 1, !ids[0].isEmpty {
-                try update(raw, state: "Queued", job: ids[0])
+                try update(raw, state: .queued, job: ids[0])
             } else { throw FeedError("Missing job ID.") }
         } catch let failure as HTTPFailure where [401,403].contains(failure.status) {
-            try update(raw, state: "Rejected", note: "SABnzbd refused access. Check the configured API key.")
+            try update(raw, state: .rejected, note: "SABnzbd refused access. Check the configured API key.")
         } catch {
-            try update(raw, state: "Checking receipt", note: "Looking for the submitted job in SABnzbd.")
+            try update(raw, state: .checkingReceipt, note: "Looking for the submitted job in SABnzbd.")
         }
+    }
+
+    /// Sends a download again that SABnzbd never confirmed. If the first NZB did arrive after all,
+    /// SABnzbd ends up with both jobs, so this is the user's call.
+    public func retryDownload(_ id: UUID) async throws {
+        guard !polling else { throw FeedError("Wait for the current download check to finish.") }
+        try await store.write {
+            try $0.execute(sql: """
+                UPDATE transfer SET state=?,note='SABnzbd never confirmed this download.'
+                WHERE video=? AND job IS NULL AND storage IS NULL AND state IN (?,?)
+                """, arguments: [TransferState.failed, id.uuidString, TransferState.submitting, TransferState.checkingReceipt])
+        }
+        try await startDownload(id)
+    }
+
+    /// Forgets a download. Its job in SABnzbd and its files stay, except for a copy Loaderoo was still staging.
+    public func removeTransfer(_ video: String) throws {
+        guard !polling else { throw FeedError("Wait for the current download check to finish.") }
+        try Filer(store: store, moves: moves).abandon(video)
     }
 
     private static func jobName(_ response: HTTPURLResponse, fallback: String) -> String {
@@ -189,7 +231,7 @@ extension LiveFeed {
         return component(stem)
     }
 
-    private func update(_ id: String, state: String, job: String? = nil, note: String? = nil, storage: String? = nil,
+    private func update(_ id: String, state: TransferState, job: String? = nil, note: String? = nil, storage: String? = nil,
                         name: String? = nil, progress: Double? = nil, timeLeft: String? = nil) throws {
         try store.write { try $0.execute(sql: "UPDATE transfer SET state=?,job=COALESCE(?,job),note=?,storage=COALESCE(?,storage),jobName=COALESCE(?,jobName),progress=?,timeLeft=? WHERE video=? AND storage IS NULL",
                                         arguments: [state,job,note,storage,name,progress,timeLeft,id]) }
@@ -202,8 +244,8 @@ extension LiveFeed {
         let ids = try await store.read { db in
             try String.fetchAll(db, sql: """
                 SELECT t.video FROM transfer t LEFT JOIN studioRetry r ON t.video=r.video
-                WHERE t.state='Completed' AND COALESCE(t.studio,'')='' AND t.endpoint=? AND COALESCE(r.checked,0) < ? LIMIT 10
-                """, arguments: [endpoint,now-86400])
+                WHERE t.state=? AND COALESCE(t.studio,'')='' AND t.endpoint=? AND COALESCE(r.checked,0) < ? LIMIT 10
+                """, arguments: [TransferState.completed,endpoint,now-86400])
         }
         for raw in ids {
             guard let id = UUID(uuidString: raw) else { continue }
@@ -213,7 +255,8 @@ extension LiveFeed {
             try await store.write { db in
                 try db.execute(sql: "INSERT OR REPLACE INTO studioRetry VALUES(?,?)", arguments: [raw,now])
                 if let studio = detail.studio, !studio.isEmpty {
-                    try db.execute(sql: "UPDATE transfer SET studio=?,state='Ready to file' WHERE video=?", arguments: [studio,raw])
+                    try db.execute(sql: "UPDATE transfer SET studio=?,state=? WHERE video=?",
+                                   arguments: [studio,TransferState.readyToFile,raw])
                 }
             }
         }
@@ -225,22 +268,32 @@ extension LiveFeed {
         defer { polling = false }
         let endpoint = try sab.endpoint.absoluteString
         try await resolveMissingStudios(config, sab: sab)
-        for item in try transfers() where item.endpoint == endpoint && !item.retryable && item.state != "Completed" {
-            if item.storage != nil { try finish(item, sab: sab); continue }
+        for item in try transfers() where item.endpoint == endpoint && item.inProgress && item.storage == nil {
             if let (mode, hit) = try await findJob(item, sab: sab) {
-                let state = hit.status ?? "Queued"
-                if mode == "history", state == "Completed" {
-                    guard let path = hit.storage, !path.isEmpty else { throw FeedError("SABnzbd history has no completion path.") }
-                    try update(item.id, state: "Downloaded", job: hit.nzo_id, storage: path, name: hit.name, progress: 100)
+                let state = hit.status.map(TransferState.init(rawValue:)) ?? .queued
+                if mode == "history", state == .completed {
+                    if let path = hit.storage, !path.isEmpty {
+                        try update(item.id, state: .downloaded, job: hit.nzo_id, storage: path, name: hit.name, progress: 100)
+                    } else {
+                        // This job cannot be filed. The ones behind it still can.
+                        try update(item.id, state: .awaitingFiling, job: hit.nzo_id,
+                                   note: "SABnzbd history has no completion path.", name: hit.name, progress: 100)
+                    }
                 } else {
-                    try update(item.id, state: state == "Completed" ? "Processing" : state, job: hit.nzo_id,
-                               note: state == "Failed" ? hit.fail_message : nil,
+                    try update(item.id, state: state == .completed ? .processing : state, job: hit.nzo_id,
+                               note: state == .failed ? hit.fail_message : nil,
                                name: hit.name ?? hit.filename, progress: hit.percentage?.value,
-                               timeLeft: mode == "queue" && state == "Downloading" ? hit.timeleft : nil)
+                               timeLeft: mode == "queue" && hit.status == "Downloading" ? hit.timeleft : nil)
                 }
             } else {
-                try update(item.id, state: "Checking receipt", note: "Waiting for the job in SABnzbd.")
+                try update(item.id, state: .checkingReceipt, note: "Waiting for the job in SABnzbd.")
             }
+        }
+        // Filing runs away from the actor. A copy between volumes can take minutes, and the catalog,
+        // previews and new downloads must not wait for it.
+        let filer = Filer(store: store, moves: moves)
+        for item in try transfers() where item.endpoint == endpoint && item.inProgress && item.storage != nil {
+            try await Task.detached(priority: .utility) { try filer.finish(item, sab: sab) }.value
         }
     }
 

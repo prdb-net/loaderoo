@@ -65,8 +65,13 @@ public struct FeedConnections: Codable, Equatable, Sendable {
 
 struct FeedError: LocalizedError, Sendable {
     let message: String
+    /// The service did not answer at all, as opposed to answering unexpectedly.
+    let unreachable: Bool
     var errorDescription: String? { message }
-    init(_ message: String) { self.message = message }
+    init(_ message: String, unreachable: Bool = false) {
+        self.message = message
+        self.unreachable = unreachable
+    }
 }
 
 struct HTTPFailure: LocalizedError {
@@ -84,12 +89,15 @@ struct HTTPFailure: LocalizedError {
 struct FeedHTTP: Sendable {
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, HTTPURLResponse)
     let send: Transport
+    /// The same transport with room for the NZB of a very large release.
+    private let sendNZB: Transport
     private let reachability: @Sendable (NWEndpoint) async -> EndpointReachability
 
     init(reachability: @escaping @Sendable (NWEndpoint) async -> EndpointReachability = { await EndpointReachability.check($0) },
          send: @escaping Transport) {
         self.reachability = reachability
         self.send = send
+        sendNZB = send
     }
     init() {
         let config = URLSessionConfiguration.ephemeral
@@ -98,29 +106,34 @@ struct FeedHTTP: Sendable {
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 40
         let session = URLSession(configuration: config, delegate: StopRedirects(), delegateQueue: nil)
-        self.init { request in
-            let (bytes, response) = try await session.bytes(for: request)
-            guard let http = response as? HTTPURLResponse else { throw FeedError("Unexpected network response.") }
-            guard http.statusCode == 200 else { return (Data(), http) }
-            let limit = 8 * 1024 * 1024
-            guard http.expectedContentLength <= Int64(limit) else { throw FeedError("The response exceeded the size limit.") }
-            var body = Data()
-            for try await byte in bytes {
-                guard body.count < limit else { throw FeedError("The response exceeded the size limit.") }
-                body.append(byte)
+        func transport(megabytes: Int) -> Transport {
+            { request in
+                let (bytes, response) = try await session.bytes(for: request)
+                guard let http = response as? HTTPURLResponse else { throw FeedError("Unexpected network response.") }
+                guard http.statusCode == 200 else { return (Data(), http) }
+                let limit = megabytes * 1024 * 1024
+                guard http.expectedContentLength <= Int64(limit) else { throw FeedError("The response exceeded the size limit.") }
+                var body = Data()
+                for try await byte in bytes {
+                    guard body.count < limit else { throw FeedError("The response exceeded the size limit.") }
+                    body.append(byte)
+                }
+                return (body, http)
             }
-            return (body, http)
         }
+        reachability = { await EndpointReachability.check($0) }
+        send = transport(megabytes: 8)
+        sendNZB = transport(megabytes: 64)
     }
 
     func data(_ request: URLRequest, retryReadIfReachable: Bool = false) async throws -> Data {
         try await response(request, retryReadIfReachable: retryReadIfReachable).0
     }
 
-    func response(_ request: URLRequest, retryReadIfReachable: Bool = false) async throws -> (Data, HTTPURLResponse) {
+    func response(_ request: URLRequest, retryReadIfReachable: Bool = false, nzb: Bool = false) async throws -> (Data, HTTPURLResponse) {
         let body: Data
         let response: HTTPURLResponse
-        do { (body, response) = try await send(request) }
+        do { (body, response) = try await (nzb ? sendNZB : send)(request) }
         catch is CancellationError { throw CancellationError() }
         catch let error as URLError where error.code == .notConnectedToInternet {
             if let url = request.url, let endpoint = EndpointReachability.endpoint(for: url) {
@@ -128,13 +141,18 @@ struct FeedHTTP: Sendable {
                 try Task.checkCancellation()
                 if status == .localNetworkDenied { throw LocalNetworkAccessRequired(endpoint: endpoint) }
                 if status == .reachable, retryReadIfReachable, request.httpMethod == "GET" {
-                    return try await self.response(request)
+                    return try await self.response(request, nzb: nzb)
                 }
             }
-            throw FeedError("Connection failed. Check the address and network.")
+            throw FeedError("Connection failed. Check the address and network.", unreachable: true)
+        }
+        catch let error as URLError where error.code == .appTransportSecurityRequiresSecureConnection {
+            // macOS only lets http through to IP addresses, .local names and names without a dot.
+            throw FeedError("macOS blocked this unencrypted connection. Use https, the IP address or a .local name.",
+                            unreachable: true)
         }
         catch let error as FeedError { throw error }
-        catch { throw FeedError("Connection failed. Check the address and network.") }
+        catch { throw FeedError("Connection failed. Check the address and network.", unreachable: true) }
         guard response.statusCode == 200 else {
             let value = response.value(forHTTPHeaderField: "Retry-After") ?? ""
             let deadline = Double(value).flatMap { $0.isFinite && $0 >= 0 ? Date.now.addingTimeInterval($0) : nil }

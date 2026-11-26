@@ -310,7 +310,10 @@ struct LiveFeedTests {
         #expect(first.issues.count == 1)
         #expect(first.titles.first?.sources == ["two"])
         _ = try await feed.refresh(manual: true)
-        #expect(await service.searches == ["one.example.invalid", "two.example.invalid", "two.example.invalid"])
+        // Both indexers are read side by side, so the first two requests arrive in either order.
+        var searches = await service.searches
+        if searches.count >= 2 { searches[0..<2].sort() }
+        #expect(searches == ["one.example.invalid", "two.example.invalid", "two.example.invalid"])
     }
 
     @Test func missingPostingTimeStaysUnknownAndReleaseQualityIsPreserved() async throws {
@@ -326,7 +329,7 @@ struct LiveFeedTests {
             #expect(query?.first(where: { $0.name == "attrs" })?.value?.contains("usenetdate") == true)
             return (Data(xml.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!)
         })
-        let results = try await reader.latest(connections().indexers[0])
+        let results = try await reader.page(connections().indexers[0], offset: 0).uploads
         let parsed = try #require(results.first)
         #expect(parsed.posted == nil)
         #expect(parsed.quality == "1080p")

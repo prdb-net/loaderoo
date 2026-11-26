@@ -20,6 +20,13 @@ struct ConnectionsForm: View {
             Form {
                 if downloadSettings {
                     SABForm(connection: Binding(get: { draft.sab ?? SABConnection() }, set: { draft.sab = $0 }))
+                    if draft.sab != nil {
+                        Section {
+                            Button("Remove SABnzbd Connection", role: .destructive) { draft.sab = nil }
+                        } footer: {
+                            Text("Jobs already sent stay in SABnzbd. Loaderoo stops following them once you save.")
+                        }
+                    }
                 } else {
                     Section("PRDB") { SecureField("Personal API key", text: $draft.prdbKey) }
                     ForEach($draft.indexers) { $indexer in

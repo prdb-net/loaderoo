@@ -1,0 +1,27 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Package.swift needs Swift 6.1, which ships with Xcode 16.3 and later.
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show the toolchain
+        run: swift --version
+      - name: Build the app
+        run: swift build
+      - name: Run the offline tests
+        run: swift test
+      # The app ships optimized, and the optimizer has behaved differently from a debug build before.
+      - name: Run the tests against an optimized build
+        run: swift test -c release -Xswiftc -enable-testing

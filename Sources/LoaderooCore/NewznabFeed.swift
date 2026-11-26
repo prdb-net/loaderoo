@@ -41,10 +41,6 @@ struct Upload: Codable, Equatable, Sendable {
 struct NewznabFeed {
     let http: FeedHTTP
 
-    func latest(_ connection: IndexerConnection) async throws -> [Upload] {
-        try await page(connection, offset: 0).uploads
-    }
-
     struct Page {
         let uploads: [Upload]
         let next: Int?

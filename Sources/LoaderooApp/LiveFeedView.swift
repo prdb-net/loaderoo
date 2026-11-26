@@ -7,19 +7,18 @@ private enum LiveSection: String, CaseIterable, Identifiable {
     var id: Self { self }
     var symbol: String {
         switch self {
-        case .prdb: "film.stack"
+        case .releases: "rectangle.stack"
+        case .prdb, .library: "film.stack"
         case .studios: DirectoryKind.studios.symbol
         case .actors: DirectoryKind.actors.symbol
-        case .downloads: SectionName.downloads.symbol
-        case .library: SectionName.library.symbol
-        case .releases: SectionName.releases.symbol
+        case .downloads: "arrow.down.circle"
         }
     }
 }
 
 struct LiveFeedView: View {
     let openDemo: () -> Void
-    @State private var model = FeedWorkspace()
+    @State private var model: FeedWorkspace
     @State private var selection: LiveSection = .releases
     @State private var profileVisit: ProfileVisit?
     @State private var editing = false
@@ -29,6 +28,11 @@ struct LiveFeedView: View {
     @State private var search = ""
     @State private var manageFolders = false
     @State private var windowSize = CGSize(width: 740, height: 450)
+
+    init(demo: Bool, openDemo: @escaping () -> Void) {
+        self.openDemo = openDemo
+        _model = State(initialValue: FeedWorkspace(demo: demo))
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -42,8 +46,14 @@ struct LiveFeedView: View {
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 230)
             .safeAreaInset(edge: .bottom, alignment: .leading) {
-                Button("Connections", systemImage: "gearshape") { settings() }
-                    .buttonStyle(.plain).padding(16)
+                if model.demo {
+                    Label("Local demo", systemImage: "desktopcomputer")
+                        .font(.callout).foregroundStyle(.secondary).padding(16)
+                        .help("PRDB, both indexers and SABnzbd are simulated on this Mac.")
+                } else {
+                    Button("Connections", systemImage: "gearshape") { settings() }
+                        .buttonStyle(.plain).padding(16)
+                }
             }
         } detail: {
             workspace
@@ -67,9 +77,12 @@ struct LiveFeedView: View {
         .task {
             var tick = 0
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(10)) } catch { break }
+                // The demo's simulated download takes twelve seconds.
+                do { try await Task.sleep(for: .seconds(model.demo ? 2 : 10)) } catch { break }
                 tick += 1
-                if model.jobs.contains(where: { !$0.retryable && $0.state != "Completed" || $0.state == "Completed" && $0.studio == nil && tick.isMultiple(of: 90) }) { await model.follow() }
+                // Downloads without a studio are asked about again every fifteen minutes.
+                let studioCheck = tick.isMultiple(of: 90)
+                if model.jobs.contains(where: { $0.inProgress || $0.awaitsStudio && studioCheck }) { await model.follow() }
                 if tick.isMultiple(of: 8640), !model.folders.isEmpty { await model.scan() }
             }
         }
@@ -83,7 +96,7 @@ struct LiveFeedView: View {
 
     private var workspace: some View {
         VStack(spacing: 0) {
-            let issues = [model.error, model.downloadIssue].compactMap { $0 } + model.page.issues
+            let issues = [model.error, model.downloadIssue].compactMap { $0 } + model.issues
             if !issues.isEmpty {
                 Text(issues.joined(separator: "\n")).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10).background(.quaternary)
@@ -184,7 +197,7 @@ struct LiveFeedView: View {
     }
     private var filed: [Transfer] {
         let paths = Set(model.files.map(\.path))
-        return model.jobs.filter { $0.state == "Completed" && !paths.contains($0.localPath ?? "") }
+        return model.jobs.filter { $0.completed && !paths.contains($0.localPath ?? "") }
     }
     private var searchBinding: Binding<String> {
         switch selection {
@@ -271,7 +284,11 @@ struct LiveFeedView: View {
                 Button("Add Folder…", systemImage: "plus") {
                     if let url = chooseFolder() { Task { await model.scan(adding: url) } }
                 }.disabled(model.scanning)
-                if model.scanning { ProgressView().controlSize(.small); Text("Scanning…") }
+                if model.scanning {
+                    ProgressView().controlSize(.small)
+                    Text("Scanning…")
+                    Button("Stop") { model.stopScan() }.help("Stop the scan. Files read so far keep their place.")
+                }
                 Spacer()
                 Button("Done") { manageFolders = false }.keyboardShortcut(.defaultAction)
             }

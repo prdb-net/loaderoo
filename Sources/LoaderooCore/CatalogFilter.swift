@@ -1,7 +1,6 @@
 import Foundation
 
 public struct CatalogFilter: Equatable, Sendable {
-    public var studio: String?
     public var studioIDs = Set<CatalogSubject.ID>()
     public var actorIDs = Set<CatalogSubject.ID>()
     public var quality: String?
@@ -14,8 +13,7 @@ public struct CatalogFilter: Equatable, Sendable {
         let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
         let since = days.flatMap { Calendar.current.date(byAdding: .day, value: -$0, to: now) }
         return page.titles.filter { title in
-            guard !onlyWithPreview || title.preview != nil || title.userPreviews?.sheet != nil,
-                  studio == nil || title.studio == studio else { return false }
+            guard !onlyWithPreview || title.preview != nil || title.userPreviews?.sheet != nil else { return false }
             if !studioIDs.isEmpty, !studioIDs.contains(where: { $0.matches(title) }) { return false }
             if !actorIDs.isEmpty, !actorIDs.contains(where: { $0.matches(title) }) { return false }
             return title.offers.contains { offer in

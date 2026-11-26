@@ -5,12 +5,11 @@ private enum DownloadScope: String, CaseIterable {
     case all = "All", active = "Active", completed = "Completed", attention = "Needs attention"
 
     func includes(_ job: Transfer) -> Bool {
-        let needsAttention = job.retryable || ["Awaiting filing", "Checking receipt"].contains(job.state)
         switch self {
-        case .all: return true
-        case .active: return !needsAttention && job.state != "Completed"
-        case .completed: return job.state == "Completed"
-        case .attention: return needsAttention
+        case .all: true
+        case .active: !job.needsAttention && !job.completed
+        case .completed: job.completed
+        case .attention: job.needsAttention
         }
     }
 }
@@ -28,7 +27,7 @@ struct DownloadsView<Controls: View, Action: View>: View {
         let jobs = model.jobs.filter { job in
             guard scope.includes(job) else { return false }
             if words.isEmpty { return true }
-            let text = [job.title, job.studio, job.provider, job.releaseName, job.jobName, job.state, job.localPath, job.storage]
+            let text = [job.title, job.studio, job.provider, job.releaseName, job.jobName, job.state.rawValue, job.localPath, job.storage]
                 .compactMap { $0 }.joined(separator: " ")
             return words.allSatisfy { text.localizedStandardContains($0) }
         }
@@ -50,7 +49,7 @@ struct DownloadsView<Controls: View, Action: View>: View {
                         if let studio = job.studio { Text(studio).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                     }.padding(.vertical, 3)
                 }.width(min: 100, ideal: 220)
-                TableColumn("Status", value: \.state).width(min: 78, ideal: 106)
+                TableColumn("Status", value: \.state.rawValue).width(min: 78, ideal: 106)
                 TableColumn("Progress") { job in
                     if let value = job.progress ?? (job.storage != nil ? 100 : nil) {
                         HStack(spacing: 5) {
@@ -96,7 +95,7 @@ struct DownloadsView<Controls: View, Action: View>: View {
         VStack(alignment: .leading, spacing: 14) {
             LiveArtwork(remote: job.image.flatMap(URL.init(string:))).aspectRatio(16/9, contentMode: .fit)
             Text(job.title).font(.title2.bold()).textSelection(.enabled)
-            Text(job.state).font(.headline)
+            Text(job.state.rawValue).font(.headline)
             if let progress = job.progress, job.storage == nil {
                 ProgressView(value: progress, total: 100) {
                     Text((progress / 100).formatted(.percent.precision(.fractionLength(0))))
@@ -116,9 +115,17 @@ struct DownloadsView<Controls: View, Action: View>: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: path)])
                 }
             }
-            if job.retryable, let title = model.page.titles.first(where: { $0.id.uuidString == job.video }) {
-                retry(title)
+            let title = model.page.titles.first { $0.id.uuidString == job.video }
+            if job.retryable, let title { retry(title) }
+            if job.awaitsReceipt, title != nil {
+                Button("Send Again", systemImage: "arrow.clockwise") { Task { await model.resend(job) } }
+                    .disabled(model.following || UUID(uuidString: job.video).map(model.sending.contains) == true)
+                    .help("Send the NZB to SABnzbd again. Check its queue first, because Loaderoo cannot tell whether the first one arrived.")
             }
+            Button("Remove from Downloads", systemImage: "trash") { Task { await model.remove(job) } }
+                .disabled(model.following)
+                .help(job.completed ? "Forget this download. The video stays on disk and is offered again unless your library holds it."
+                                    : "Forget this download. A job in SABnzbd and its files stay where they are.")
         }
     }
 

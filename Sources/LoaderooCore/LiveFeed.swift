@@ -57,6 +57,9 @@ public actor LiveFeed {
     private let newznab: NewznabFeed
     let prdb: PRDBFeed
     let http: FeedHTTP
+    let moves: FileMoves
+    private let vault: SecretStore?
+    private var secrets: ConnectionSecrets?
     var scanning = false
     var receiptHistoryUpdates: [String: Int] = [:]
     var polling = false
@@ -64,87 +67,42 @@ public actor LiveFeed {
     private var previewRequests: [UUID: Task<UserPreviews, Error>] = [:]
 
     public init(root: URL) throws {
-        try self.init(root: root, http: FeedHTTP())
+        try self.init(root: root, http: FeedHTTP(), vault: .forThisBuild)
     }
 
-    init(root: URL, http: FeedHTTP) throws {
+    init(root: URL, http: FeedHTTP, vault: SecretStore? = nil, moves: FileMoves = FileMoves()) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         store = try DatabaseQueue(path: root.appending(path: "Feed.sqlite").path)
         self.http = http
+        self.vault = vault
+        self.moves = moves
         newznab = NewznabFeed(http: http)
         prdb = PRDBFeed(http: http)
-        try store.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS connection (id INTEGER PRIMARY KEY CHECK(id = 1), config BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS sourceClock (id TEXT PRIMARY KEY, poll DOUBLE, retry DOUBLE);
-                CREATE TABLE IF NOT EXISTS offer (
-                    ref TEXT PRIMARY KEY, source TEXT NOT NULL, entry TEXT NOT NULL, payload BLOB NOT NULL,
-                    lastSeen DOUBLE NOT NULL, nextCheck DOUBLE, video TEXT, UNIQUE(source, entry));
-                CREATE INDEX IF NOT EXISTS offerVideo ON offer(video);
-                CREATE INDEX IF NOT EXISTS offerCheck ON offer(nextCheck,ref);
-                CREATE TABLE IF NOT EXISTS metadata (video TEXT PRIMARY KEY, payload BLOB NOT NULL, fetched DOUBLE NOT NULL);
-                CREATE TABLE IF NOT EXISTS folder(path TEXT PRIMARY KEY, offline BOOLEAN NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS libraryFile(
-                    path TEXT PRIMARY KEY, root TEXT NOT NULL, size INTEGER NOT NULL, modified DOUBLE NOT NULL,
-                    hash TEXT, video TEXT, title TEXT, studio TEXT, image TEXT, seen TEXT NOT NULL, checked DOUBLE);
-                CREATE INDEX IF NOT EXISTS libraryVideo ON libraryFile(video);
-                CREATE TABLE IF NOT EXISTS transfer(
-                    video TEXT PRIMARY KEY, title TEXT NOT NULL, studio TEXT, image TEXT, provider TEXT NOT NULL,
-                    endpoint TEXT NOT NULL, token TEXT UNIQUE NOT NULL, job TEXT, state TEXT NOT NULL,
-                    note TEXT, storage TEXT, localPath TEXT, created DOUBLE NOT NULL);
-                CREATE TABLE IF NOT EXISTS paging(source TEXT PRIMARY KEY, offset INTEGER);
-                CREATE TABLE IF NOT EXISTS transferSource(video TEXT PRIMARY KEY,entry TEXT NOT NULL,releaseName TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS completedFile(video TEXT PRIMARY KEY,size INTEGER NOT NULL,modified DOUBLE NOT NULL);
-                CREATE TABLE IF NOT EXISTS studioRetry(video TEXT PRIMARY KEY,checked DOUBLE NOT NULL);
-                CREATE TABLE IF NOT EXISTS staging(video TEXT PRIMARY KEY,path TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS filing(video TEXT PRIMARY KEY,plan BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS actorProfileCache(id TEXT PRIMARY KEY,payload BLOB,checked REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS previewUpgrade(version INTEGER PRIMARY KEY);
-                """)
-            try PRDBCatalog.createTables(db)
-            if try !db.columns(in: "paging").contains(where: { $0.name == "oldest" }) {
-                try db.execute(sql: "ALTER TABLE paging ADD COLUMN oldest DOUBLE")
-                try db.execute(sql: """
-                    UPDATE paging SET oldest = (SELECT MIN(json_extract(CAST(payload AS TEXT),'$.posted'))
-                    FROM offer WHERE offer.source = paging.source)
-                    """)
-            }
-            if try !db.columns(in: "transfer").contains(where: { $0.name == "jobName" }) {
-                try db.execute(sql: """
-                    ALTER TABLE transfer ADD COLUMN jobName TEXT;
-                    ALTER TABLE transfer ADD COLUMN progress DOUBLE;
-                    ALTER TABLE transfer ADD COLUMN timeLeft TEXT;
-                    """)
-            }
-            if try !db.columns(in: "paging").contains(where: { $0.name == "historyPages" }) {
-                // Older builds kept the exact next offset, but not the sizes of individual pages.
-                try db.execute(sql: """
-                    ALTER TABLE paging ADD COLUMN historyPages INTEGER NOT NULL DEFAULT 0;
-                    ALTER TABLE paging ADD COLUMN through DOUBLE;
-                    ALTER TABLE paging ADD COLUMN lastAttempt DOUBLE;
-                    UPDATE paging SET historyPages = (offset - 1) / 100 WHERE offset > 100;
-                    """)
-            }
-            if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade)") == false {
-                try db.execute(sql: "UPDATE metadata SET fetched=0 WHERE json_extract(CAST(payload AS TEXT),'$.image') IS NULL")
-                try db.execute(sql: "INSERT INTO previewUpgrade VALUES(1)")
-            }
-            if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade WHERE version=2)") == false {
-                try db.execute(sql: "UPDATE metadata SET fetched=0 WHERE json_extract(CAST(payload AS TEXT),'$.siteImages') IS NULL")
-                try db.execute(sql: "INSERT INTO previewUpgrade VALUES(2)")
-            }
-            if try Bool.fetchOne(db, sql: "SELECT EXISTS(SELECT 1 FROM previewUpgrade WHERE version=3)") == false {
-                try db.execute(sql: "UPDATE metadata SET fetched=0")
-                try db.execute(sql: "INSERT INTO previewUpgrade VALUES(3)")
-            }
-        }
+        try Schema.migrate(store)
     }
 
     public func connections() throws -> FeedConnections? {
-        try store.read { db in
+        let saved = try store.read { db in
             try Data.fetchOne(db, sql: "SELECT config FROM connection").map { try JSONDecoder().decode(FeedConnections.self, from: $0) }
         }
+        guard var config = saved, let vault else { return saved }
+        if secrets == nil {
+            var known = try vault.load().map { try JSONDecoder().decode(ConnectionSecrets.self, from: $0) } ?? ConnectionSecrets()
+            // Keys saved by a build that kept them in the database move over on first use.
+            let found = config.detachSecrets()
+            if !found.isEmpty {
+                if !found.prdb.isEmpty { known.prdb = found.prdb }
+                if !found.sab.isEmpty { known.sab = found.sab }
+                known.indexers.merge(found.indexers) { $1 }
+                try vault.save(JSONEncoder().encode(known))
+                let bare = try JSONEncoder().encode(config)
+                try store.write { try $0.execute(sql: "UPDATE connection SET config=?", arguments: [bare]) }
+            }
+            secrets = known
+        }
+        config.attach(secrets ?? ConnectionSecrets())
+        return config
     }
 
     public func configure(_ draft: FeedConnections, verifySAB: Bool = false) async throws {
@@ -170,18 +128,30 @@ public actor LiveFeed {
                 throw FeedError("PRDB: " + error.localizedDescription)
             }
         }
+        var bare = config
+        if let vault {
+            let keys = bare.detachSecrets()
+            try vault.save(JSONEncoder().encode(keys))
+            secrets = keys
+        }
+        let stored = try JSONEncoder().encode(bare)
         try await store.write { db in
             for previous in old?.indexers ?? [] {
-                if !config.indexers.contains(previous) {
-                    try db.execute(sql: "DELETE FROM offer WHERE source = ?", arguments: [previous.id.uuidString])
-                    try db.execute(sql: "DELETE FROM paging WHERE source=?", arguments: [previous.id.uuidString])
-                    try db.execute(sql: "DELETE FROM sourceClock WHERE id = ?", arguments: [previous.id.uuidString])
+                let id = previous.id.uuidString
+                let current = config.indexers.first { $0.id == previous.id }
+                // A new name or API key still serves the same listings. Another address or category does not.
+                if current?.address != previous.address || current?.categories != previous.categories {
+                    try db.execute(sql: "DELETE FROM offer WHERE source = ?", arguments: [id])
+                    try db.execute(sql: "DELETE FROM paging WHERE source=?", arguments: [id])
+                    try db.execute(sql: "DELETE FROM sourceClock WHERE id = ?", arguments: [id])
+                } else if current?.apiKey != previous.apiKey {
+                    try db.execute(sql: "UPDATE sourceClock SET retry=NULL WHERE id = ?", arguments: [id])
                 }
             }
             if old?.prdbKey != config.prdbKey {
                 try db.execute(sql: "DELETE FROM sourceClock WHERE id = 'PRDB'")
             }
-            try db.execute(sql: "INSERT OR REPLACE INTO connection VALUES (1, ?)", arguments: [try JSONEncoder().encode(config)])
+            try db.execute(sql: "INSERT OR REPLACE INTO connection VALUES (1, ?)", arguments: [stored])
         }
     }
 
@@ -215,8 +185,8 @@ public actor LiveFeed {
             indexerSearch?.offsets = Dictionary(uniqueKeysWithValues: config.indexers.map { ($0.id.uuidString, 0) })
         }
         var issues: [String] = []
+        var requests: [(source: IndexerConnection, offset: Int)] = []
         for source in config.indexers {
-            try Task.checkCancellation()
             let id = source.id.uuidString
             let offset: Int
             if let indexerSearch {
@@ -230,16 +200,33 @@ public actor LiveFeed {
                 if try !clock(for: id, now: now, includePoll: false) { issues.append("\(source.name): waiting to retry.") }
                 continue
             }
-            do {
-                let page = try await newznab.page(source, offset: offset, term: search?.term)
-                try Task.checkCancellation()
-                let refs = try remember(page, source: id, offset: offset, searching: search != nil, now: now)
+            requests.append((source, offset))
+        }
+        try Task.checkCancellation()
+        // A slow indexer must not hold up the others. Awaiting the tasks in turn keeps each page with its
+        // request. A task group handing back `(index, page)` lost the index in optimized builds (Swift 6.4).
+        let reader = newznab, term = search?.term
+        let fetches = requests.map { request in
+            Task { try await reader.page(request.source, offset: request.offset, term: term) }
+        }
+        let pages = await withTaskCancellationHandler {
+            var pages: [Result<NewznabFeed.Page, any Error>] = []
+            for fetch in fetches { pages.append(await fetch.result) }
+            return pages
+        } onCancel: {
+            for fetch in fetches { fetch.cancel() }
+        }
+        try Task.checkCancellation()
+        for (request, page) in zip(requests, pages) {
+            let id = request.source.id.uuidString
+            switch page {
+            case .success(let page):
+                let refs = try remember(page, source: id, offset: request.offset, searching: search != nil, now: now)
                 indexerSearch?.offerIDs.formUnion(refs)
                 indexerSearch?.offsets?[id] = page.next
-            } catch {
-                try Task.checkCancellation()
+            case .failure(let error):
                 try backoff(error, service: id, now: now)
-                issues.append("\(source.name): \(error.localizedDescription)")
+                issues.append("\(request.source.name): \(error.localizedDescription)")
             }
         }
         let cutoff = now.addingTimeInterval(-90 * 86400).timeIntervalSince1970
@@ -254,7 +241,12 @@ public actor LiveFeed {
             try $0.execute(sql: "DELETE FROM metadata WHERE video NOT IN (SELECT video FROM offer WHERE video IS NOT NULL)")
         }
         if try clock(for: "PRDB", now: now, includePoll: false) {
-            do { try await enrich(config, now: now, manual: manual) }
+            do {
+                let unanswered = try await enrich(config, now: now, manual: manual)
+                if unanswered > 0 {
+                    issues.append("PRDB: \(unanswered) \(unanswered == 1 ? "entry" : "entries") could not be read. Loaderoo will ask again in an hour.")
+                }
+            }
             catch {
                 try Task.checkCancellation()
                 try backoff(error, service: "PRDB", now: now)
@@ -355,7 +347,15 @@ public actor LiveFeed {
         }
     }
 
-    private func enrich(_ config: FeedConnections, now: Date, manual: Bool) async throws {
+    /// Whether a failure concerns the one request, as opposed to PRDB being unreachable, limited or refusing the key.
+    static func concernsOneRequest(_ error: any Error) -> Bool {
+        if let failure = error as? HTTPFailure { return failure.retryAt == nil && ![401, 403, 429].contains(failure.status) }
+        return (error as? FeedError)?.unreachable == false
+    }
+
+    /// Matches due listings and loads missing video details. Returns how many entries PRDB could not
+    /// answer for. Those wait an hour, so that one of them cannot hold up everything behind it.
+    private func enrich(_ config: FeedConnections, now: Date, manual: Bool) async throws -> Int {
         let sources = Dictionary(uniqueKeysWithValues: config.indexers.map { ($0.id.uuidString, $0) })
         let due = try await store.read { db in
             try Row.fetchAll(db, sql: "SELECT * FROM offer WHERE nextCheck <= ? ORDER BY nextCheck,ref LIMIT 400",
@@ -364,18 +364,13 @@ public actor LiveFeed {
                 return PendingUpload(ref: row["ref"], connection: source, upload: try JSONDecoder().decode(Upload.self, from: row["payload"]))
             }
         }
+        // Failed requests tolerated in one round. A round still ends early when PRDB fails throughout.
+        var allowance = 12
+        var unanswered = 0
         for start in stride(from: 0, to: due.count, by: 100) {
             try Task.checkCancellation()
-            let results = try await prdb.resolve(Array(due[start..<min(start+100, due.count)]), key: config.prdbKey)
-            try await store.write { db in
-                for row in results {
-                    let permanent = ["unsupported", "invalid"].contains(row.status)
-                    let later = row.recheckAfterUtc.flatMap(feedDate) ?? now.addingTimeInterval(86400)
-                    let next = permanent ? nil : max(now.addingTimeInterval(60), later).timeIntervalSince1970
-                    try db.execute(sql: "UPDATE offer SET video=?,nextCheck=? WHERE ref=?",
-                                   arguments: [row.confirmedID?.uuidString, next, row.ref])
-                }
-            }
+            try await resolve(Array(due[start..<min(start+100, due.count)]), key: config.prdbKey, now: now,
+                              allowance: &allowance, unanswered: &unanswered)
         }
         let missing = try await store.read { db in
             try String.fetchAll(db, sql: """
@@ -387,20 +382,83 @@ public actor LiveFeed {
                 """, arguments: [now.addingTimeInterval(-86400).timeIntervalSince1970, manual,
                                  now.addingTimeInterval(-900).timeIntervalSince1970])
         }
-        for raw in missing {
+        let reader = prdb, key = config.prdbKey
+        let hourLater = now.addingTimeInterval(3600).timeIntervalSince1970
+        // Four videos at a time. Their answers are taken up in order.
+        for start in stride(from: 0, to: missing.count, by: 4) {
             try Task.checkCancellation()
-            guard let id = UUID(uuidString: raw) else { continue }
-            do {
-                let detail = try await prdb.video(id, key: config.prdbKey)
-                try await store.write {
-                    try $0.execute(sql: "INSERT OR REPLACE INTO metadata VALUES (?,?,?)",
-                                   arguments: [raw, try JSONEncoder().encode(detail), now.timeIntervalSince1970])
+            let videos = missing[start..<min(start + 4, missing.count)]
+            let lookups = videos.map { raw in
+                Task {
+                    guard let id = UUID(uuidString: raw) else { throw HTTPFailure(status: 404, retryAt: nil) }
+                    return try await reader.video(id, key: key)
                 }
-            } catch let error as HTTPFailure where error.status == 404 || error.status == 410 {
-                try await store.write {
-                    try $0.execute(sql: "UPDATE offer SET video=NULL,nextCheck=? WHERE video=?",
-                                   arguments: [now.addingTimeInterval(86400).timeIntervalSince1970,raw])
+            }
+            let answers = await withTaskCancellationHandler {
+                var answers: [Result<FeedMetadata, any Error>] = []
+                for lookup in lookups { answers.append(await lookup.result) }
+                return answers
+            } onCancel: {
+                for lookup in lookups { lookup.cancel() }
+            }
+            try Task.checkCancellation()
+            for (raw, answer) in zip(videos, answers) {
+                switch answer {
+                case .success(let detail):
+                    try await store.write {
+                        try $0.execute(sql: "INSERT OR REPLACE INTO metadata VALUES (?,?,?)",
+                                       arguments: [raw, try JSONEncoder().encode(detail), now.timeIntervalSince1970])
+                    }
+                case .failure(let error as HTTPFailure) where error.status == 404 || error.status == 410:
+                    try await store.write {
+                        try $0.execute(sql: "UPDATE offer SET video=NULL,nextCheck=? WHERE video=?",
+                                       arguments: [now.addingTimeInterval(86400).timeIntervalSince1970,raw])
+                    }
+                case .failure(let error):
+                    guard Self.concernsOneRequest(error), allowance > 0 else { throw error }
+                    allowance -= 1
+                    unanswered += 1
+                    try await store.write { db in
+                        // Details that only failed to refresh stay on show. A video without any is matched again later.
+                        try db.execute(sql: "UPDATE metadata SET fetched=? WHERE video=?", arguments: [hourLater - 86400, raw])
+                        if db.changesCount == 0 {
+                            try db.execute(sql: "UPDATE offer SET video=NULL,nextCheck=? WHERE video=?", arguments: [hourLater, raw])
+                        }
+                    }
                 }
+            }
+        }
+        return unanswered
+    }
+
+    private func resolve(_ batch: [PendingUpload], key: String, now: Date, allowance: inout Int, unanswered: inout Int) async throws {
+        let results: [Resolution]
+        do { results = try await prdb.resolve(batch, key: key) }
+        catch {
+            try Task.checkCancellation()
+            guard Self.concernsOneRequest(error), allowance > 0 else { throw error }
+            allowance -= 1
+            if batch.count > 1 {
+                // Halve the batch until the listing PRDB cannot answer for stands alone.
+                let half = batch.count / 2
+                try await resolve(Array(batch[..<half]), key: key, now: now, allowance: &allowance, unanswered: &unanswered)
+                try await resolve(Array(batch[half...]), key: key, now: now, allowance: &allowance, unanswered: &unanswered)
+            } else {
+                unanswered += 1
+                try await store.write {
+                    try $0.execute(sql: "UPDATE offer SET nextCheck=? WHERE ref=?",
+                                   arguments: [now.addingTimeInterval(3600).timeIntervalSince1970, batch[0].ref])
+                }
+            }
+            return
+        }
+        try await store.write { db in
+            for row in results {
+                let permanent = ["unsupported", "invalid"].contains(row.status)
+                let later = row.recheckAfterUtc.flatMap(feedDate) ?? now.addingTimeInterval(86400)
+                let next = permanent ? nil : max(now.addingTimeInterval(60), later).timeIntervalSince1970
+                try db.execute(sql: "UPDATE offer SET video=?,nextCheck=? WHERE ref=?",
+                               arguments: [row.confirmedID?.uuidString, next, row.ref])
             }
         }
     }
@@ -451,7 +509,11 @@ public actor LiveFeed {
             page.oldestBrowsed = try Double.fetchOne(db, sql: "SELECT MIN(oldest) FROM paging").map(Date.init(timeIntervalSinceReferenceDate:))
             page.releaseCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM offer") ?? 0
             page.pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM offer WHERE video IS NULL AND nextCheck IS NOT NULL") ?? 0
-            let rows = try Row.fetchAll(db, sql: "SELECT o.ref,o.source,o.payload,m.payload AS detail FROM offer o JOIN metadata m ON m.video=o.video WHERE NOT EXISTS (SELECT 1 FROM libraryFile f WHERE f.video=o.video) AND NOT EXISTS (SELECT 1 FROM transfer t WHERE t.video=o.video AND t.storage IS NOT NULL)")
+            let rows = try Row.fetchCursor(db, sql: """
+                SELECT o.ref,o.source,o.video,o.payload,m.payload AS detail FROM offer o JOIN metadata m ON m.video=o.video
+                WHERE NOT EXISTS (SELECT 1 FROM libraryFile f WHERE f.video=o.video)
+                AND NOT EXISTS (SELECT 1 FROM transfer t WHERE t.video=o.video AND t.storage IS NOT NULL)
+                """)
             struct Group {
                 let metadata: FeedMetadata
                 var posted: Date?
@@ -459,17 +521,19 @@ public actor LiveFeed {
                 var qualities = Set<String>()
                 var offers: [FeedOffer] = []
             }
-            var groups: [UUID: Group] = [:]
-            for row in rows {
-                let detail = try JSONDecoder().decode(FeedMetadata.self, from: row["detail"])
-                let upload = try JSONDecoder().decode(Upload.self, from: row["payload"])
+            let decoder = JSONDecoder()
+            // Several offers share a video. Its details are read once.
+            var groups: [String: Group] = [:]
+            while let row = try rows.next() {
                 guard let name = sources[row["source"]] else { continue }
-                var group = groups[detail.id] ?? Group(metadata: detail, posted: upload.posted)
+                let upload = try decoder.decode(Upload.self, from: row["payload"])
+                let video: String = row["video"]
+                var group = try groups[video] ?? Group(metadata: decoder.decode(FeedMetadata.self, from: row["detail"]), posted: upload.posted)
                 if let date = upload.posted { group.posted = max(date, group.posted ?? date) }
                 group.sources.insert(name)
                 group.offers.append(FeedOffer(id: row["ref"], source: name, name: upload.title, size: upload.size, quality: upload.quality, posted: upload.posted))
                 if let quality = upload.quality { group.qualities.insert(quality) }
-                groups[detail.id] = group
+                groups[video] = group
             }
             let preferred = config.sab?.preferredQuality
             func rank(_ offer: FeedOffer) -> Int {

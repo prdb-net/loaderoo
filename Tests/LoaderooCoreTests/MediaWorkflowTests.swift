@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import LoaderooCore
 
@@ -116,7 +117,7 @@ private actor MediaAPI {
 struct MediaWorkflowTests {
     private let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
 
-    private func setup(_ api: MediaAPI) async throws -> LiveFeed {
+    private func setup(_ api: MediaAPI, moves: FileMoves = FileMoves()) async throws -> LiveFeed {
         var config = FeedConnections()
         config.prdbKey = "test"
         config.indexers[0].address = "https://index.example.invalid/api"
@@ -126,11 +127,117 @@ struct MediaWorkflowTests {
         sab.mount = root.appending(path: "mount").path
         sab.destination = root.appending(path: "videos").path
         config.sab = sab
-        let feed = try LiveFeed(root: root,http: FeedHTTP { try await api.perform($0) })
+        let feed = try LiveFeed(root: root,http: FeedHTTP { try await api.perform($0) }, moves: moves)
         try await feed.configure(config)
         let page = try await feed.refresh()
         #expect(page.titles.first?.preview == api.artwork)
         return feed
+    }
+
+    /// Downloads the test release into the mounted folder and returns its video and the studio folder.
+    private func download(_ api: MediaAPI, with feed: LiveFeed) async throws -> (clip: URL, studio: URL) {
+        let output = root.appending(path: "mount/Test.Release/")
+        let studio = root.appending(path: "videos/Studio North/")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: studio, withIntermediateDirectories: true)
+        let clip = output.appending(path: "unrecognized.mkv")
+        try Data("video".utf8).write(to: clip)
+        try Data("existing".utf8).write(to: studio.appending(path: "Harbor Walk.mkv"))
+        try await feed.startDownload(api.id)
+        await api.finish()
+        return (clip, studio)
+    }
+
+    /// An SMB or NFS share has neither hard links nor a rename that refuses to replace a file.
+    @Test(arguments: [true, false])
+    func filingWorksOnASharedVolume(downloadIsOnTheSameShare: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let copies = OSAllocatedUnfairLock(initialState: 0)
+        let share = FileMoves(link: { _, _ in throw CocoaError(.featureUnsupported) },
+                              renameExclusively: { source, _ in
+                                  if source.hasSuffix(".partial") { copies.withLock { $0 += 1 } }
+                                  return ENOTSUP
+                              }, sameVolume: { _, _ in downloadIsOnTheSameShare })
+        let api = MediaAPI()
+        let feed = try await setup(api, moves: share)
+        let (clip, studio) = try await download(api, with: feed)
+        try await feed.followDownloads()
+        let result = try #require(try await feed.transfers().first)
+        #expect(result.note == nil)
+        #expect(result.state == .completed)
+        let target = studio.appending(path: "Harbor Walk (2).mkv")
+        #expect(result.localPath == target.path)
+        #expect(try Data(contentsOf: target) == Data("video".utf8))
+        #expect(try Data(contentsOf: studio.appending(path: "Harbor Walk.mkv")) == Data("existing".utf8))
+        #expect(!fm.fileExists(atPath: clip.path))
+        #expect(try fm.contentsOfDirectory(atPath: studio.path).sorted() == ["Harbor Walk (2).mkv", "Harbor Walk.mkv"])
+        // On the same share the video is renamed. Only another volume needs a copy.
+        #expect(copies.withLock { $0 } == (downloadIsOnTheSameShare ? 0 : 1))
+    }
+
+    @Test func filingInterruptedAfterClaimingTheNameFinishesUnderThatName() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let attempts = OSAllocatedUnfairLock(initialState: 0)
+        let share = FileMoves(link: { _, _ in throw CocoaError(.featureUnsupported) },
+                              renameExclusively: { _, target in
+                                  guard attempts.withLock({ $0 += 1; return $0 }) == 1 else { return ENOTSUP }
+                                  // The first attempt claims the name and stops before its rename.
+                                  FileManager.default.createFile(atPath: target, contents: nil)
+                                  return EIO
+                              }, sameVolume: { _, _ in true })
+        let api = MediaAPI()
+        let feed = try await setup(api, moves: share)
+        let (clip, studio) = try await download(api, with: feed)
+        try await feed.followDownloads()
+        let interrupted = try #require(try await feed.transfers().first)
+        #expect(interrupted.state == .awaitingFiling)
+        #expect(FileManager.default.fileExists(atPath: clip.path))
+        try await feed.followDownloads()
+        let result = try #require(try await feed.transfers().first)
+        #expect(result.state == .completed)
+        #expect(result.localPath == studio.appending(path: "Harbor Walk (2).mkv").path)
+        #expect(try Data(contentsOf: URL(filePath: try #require(result.localPath))) == Data("video".utf8))
+        #expect(!FileManager.default.fileExists(atPath: clip.path))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theEngineAnswersWhileAVideoIsStillBeingFiled() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let started = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
+        let slow = FileMoves(link: { source, target in
+            started.signal()
+            proceed.wait()
+            try FileManager.default.linkItem(at: source, to: target)
+        })
+        let api = MediaAPI()
+        let feed = try await setup(api, moves: slow)
+        _ = try await download(api, with: feed)
+        let filing = Task { try await feed.followDownloads() }
+        await withCheckedContinuation { waiting in
+            DispatchQueue.global().async { started.wait(); waiting.resume() }
+        }
+        // A copy between volumes can take minutes. The catalog and the job list stay available meanwhile.
+        #expect(try await feed.transfers().first?.state == .downloaded)
+        #expect(try await feed.cached().titles.isEmpty)
+        proceed.signal()
+        try await filing.value
+        #expect(try await feed.transfers().first?.state == .completed)
+    }
+
+    @Test func removingADownloadKeepsItsVideoAndOffersTheTitleAgain() async throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let api = MediaAPI()
+        let feed = try await setup(api)
+        let (_, studio) = try await download(api, with: feed)
+        try await feed.followDownloads()
+        let filed = try #require(try await feed.transfers().first)
+        #expect(filed.completed)
+        #expect(try await feed.cached().titles.isEmpty)
+        try await feed.removeTransfer(filed.video)
+        #expect(try await feed.transfers().isEmpty)
+        #expect(FileManager.default.fileExists(atPath: studio.appending(path: "Harbor Walk (2).mkv").path))
+        #expect(try await feed.cached().titles.map(\.id) == [api.id])
     }
 
     @Test(arguments: [nil, .p2160, .p1080] as [ReleaseQuality?])
@@ -215,7 +322,7 @@ struct MediaWorkflowTests {
         try await reopened.followDownloads()
         let result = try #require(try await reopened.transfers().first)
         #expect(result.note == nil)
-        #expect(result.state == "Completed")
+        #expect(result.state == .completed)
         #expect(result.job == "SAB-job")
         let target = studio.appending(path: "Harbor Walk (2).mkv")
         #expect(result.localPath == target.path)
@@ -238,7 +345,7 @@ struct MediaWorkflowTests {
         #expect(await api.jobName == "Test.Release")
         try await feed.followDownloads()
         let job = try #require(try await feed.transfers().first)
-        #expect(job.state == "Downloading")
+        #expect(job.state.rawValue == "Downloading")
         #expect(job.progress == 42.5)
         #expect(job.timeLeft == "0:03:12")
         #expect(job.jobName == "Test.Release")
@@ -270,7 +377,7 @@ struct MediaWorkflowTests {
         #expect(await api.terms == ["",term,term,""])
         #expect(await api.searches == [0,0,1,1])
         var filter = CatalogFilter()
-        filter.studio = "Studio North"
+        filter.studioIDs = [.namedStudio("Studio North")]
         filter.indexer = "index.example.invalid"
         filter.quality = "2160p"
         #expect(filter.titles(in: page, matching: "archive remaster", search: nil).map(\.id) == [api.archiveID])
@@ -338,5 +445,20 @@ struct MediaWorkflowTests {
         for path in ["/downloads/complete", "/downloads/complete/../job","/downloads/complete/job"] {
             #expect(throws: FeedError.self) { try LiveFeed.completedVideo(path,sab:sab) }
         }
+    }
+
+    @Test func samplesBesideTheVideoDoNotMakeAJobAmbiguous() throws {
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appending(path: "job")
+        try FileManager.default.createDirectory(at: folder.appending(path: "Sample"), withIntermediateDirectories: true)
+        var sab = SABConnection()
+        sab.mount = root.path
+        try Data(count: 4000).write(to: folder.appending(path: "feature.mp4"))
+        try Data(count: 3000).write(to: folder.appending(path: "Sample/feature-sample.mp4"))
+        try Data(count: 100).write(to: folder.appending(path: "trailer.mkv"))
+        #expect(try LiveFeed.completedVideo("/downloads/complete/job", sab: sab).lastPathComponent == "feature.mp4")
+        // A second video of comparable size is a second video.
+        try Data(count: 3000).write(to: folder.appending(path: "part2.mp4"))
+        #expect(throws: FeedError.self) { try LiveFeed.completedVideo("/downloads/complete/job", sab: sab) }
     }
 }
